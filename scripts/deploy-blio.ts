@@ -35,10 +35,20 @@ const PRESETS: Record<number, { label: string; diamond?: string; usdc?: string }
   84532: { label: "Base Sepolia" },
 };
 
-const BASE_TX_LIMIT = process.env.BASE_TX_LIMIT || "50000000"; // $50
+const BASE_TX_LIMIT = process.env.BASE_TX_LIMIT || "100000000"; // $100
 const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "10";
 const SKIP_REGISTER = process.env.SKIP_REGISTER === "true";
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
+
+// blio Premium products (productId → USDC base units, 6 decimals) — must match
+// the app's PLANS and scripts/set-blio-products.ts. Every price must be within
+// baseTxLimit or userPlaceOrder reverts with AmountExceedsLimit.
+const BLIO_PRODUCT_PRICES: Record<number, bigint> = {
+  1: 9_990_000n,
+  2: 26_990_000n,
+  3: 49_990_000n,
+  4: 79_990_000n,
+};
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
@@ -134,6 +144,17 @@ async function main() {
   console.log(`  daily tx count:   ${DAILY_TX_COUNT_LIMIT}`);
 
   if (BigInt(DAILY_TX_COUNT_LIMIT) === 0n) throw new Error("DAILY_TX_COUNT_LIMIT must be > 0");
+
+  const baseLimit = BigInt(BASE_TX_LIMIT);
+  for (const [id, price] of Object.entries(BLIO_PRODUCT_PRICES)) {
+    if (price > baseLimit) {
+      console.warn(
+        `⚠️  product ${id} price ${usd(price.toString())} exceeds base tx limit ` +
+          `${usd(BASE_TX_LIMIT)} — userPlaceOrder will revert with AmountExceedsLimit. ` +
+          "Raise BASE_TX_LIMIT (e.g. BASE_TX_LIMIT=100000000)."
+      );
+    }
+  }
 
   if (DRY_RUN) {
     console.log("\n✅ DRY_RUN: preflight passed. Nothing deployed.");
