@@ -1,10 +1,10 @@
-# Especificación verificada — integrador blio/p2p (Fase 0)
+# Especificación verificada — integrador blio/p2p
 
-> **Fase 3 (decisión final):** se eliminó el contrato de tesorería intermedio y todo lo relativo a afiliados. El diseño vigente es **`treasury` = Safe de blio (`0xFB25…`), inmutable del constructor, settlement directo, sin vault ni reparto**. Las referencias a v1/v2 de este documento son históricas.
+> **Fase 3 (decisión final):** se eliminó el contrato de tesorería intermedio y su capa de reparto. El diseño vigente es **`treasury` = Safe de blio (`0xFB25…`), inmutable del constructor, settlement directo y sin custodia**. Las referencias a v1/v2 de este documento son históricas.
 >
-> **Estado:** solo lectura. No se modificó código de contratos, no se desplegó nada y no se tocó `blio/apps/api`.
+> **Estado:** verificación de solo lectura sobre el código del repo. No se desplegó nada ni se tocó `blio/apps/api`.
 >
-> **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD:** `21217e8`
+> **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD de referencia:** `7037b8c`
 >
 > **Fecha de verificación:** 2026-10-27 · **Red:** Base Sepolia (`chainId 84532`) · **RPC:** `https://sepolia.base.org`
 
@@ -37,6 +37,13 @@ Por tanto, la especificación combina **código del repo + comportamiento observ
 | `owner()` | `0xb975Bc0b57B7E4adBE81E2412446390e66A66D33` (misma EOA) | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` (**Safe v1.5.0, 2-de-3**) |
 | `paused()` | `false` | `false` |
 | USDC | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (`GG`, 6 dec) | mismo |
+
+**Diseño vigente (v3, esta rama):** `treasury` = Safe de blio (`0xFB25…`),
+settlement directo y sin custodia. Límites por transacción **20 USDC** (INR/liveness),
+**100 USDC** (INR/passport), **50 USDC** (otras/liveness) y **200 USDC**
+(otras/passport); `dailyTxCountLimit = 5` **colocaciones** por usuario y día UTC.
+La compra exige además una **attestation** EIP-712 de liveness o passport (tier
+con TTL de 180 días) y una moneda incluida en la allowlist.
 
 **Corrección importante:** la dirección v1 del encargo, `0x63460ae9552e0b7c3c1b4f4dcd2c4f7f0b1a6e5b`, **no tiene código** (0 bytes). La dirección real y verificada es `0x63460ae9566e9274d0034636B85243c216F2FD73`.
 
@@ -171,13 +178,48 @@ Implementación de blio (`BlioCheckoutIntegrator.sol:370-396`):
 3. Rechaza `amount == 0`.
 4. Rechaza si supera `userTxLimitFor(user, currency)`.
 5. Rechaza si el contador diario UTC del usuario ya alcanzó `dailyTxCountLimit`.
-6. Marca `pending.validated = true` y **consume** un slot del día.
+6. Marca `pending.validated = true` y **consume** un cupo diario por **colocación**
+   (no por liquidación; cancelar o reintentar no lo devuelve).
 
 El campo `validated` es el latch que garantiza:
 
 - Solo una validación exitosa por colocación.
 - Que `userPlaceOrder` pueda comprobar que el Diamond **realmente** llamó a `validateOrder`; si no, revierte con `OrderValidationMissing` (`BlioCheckoutIntegrator.sol:320-323`).
-- Que una segunda llamada del mismo tuple devuelva `false` en vez de consumir dos slots.
+- Que una segunda llamada del mismo tuple devuelva `false` en vez de consumir dos cupos.
+
+### 4.1 Gate de attestation (KYC)
+
+`userPlaceOrder` exige `tierOf[msg.sender] != Tier.None`; un comprador sin
+attestation revierte con `NotAttested` (falla cerrado y su límite es cero).
+
+- **Tiers:** `1 = Liveness`, `2 = Passport`. Solo suben; intentar bajar revierte
+  con `TierDowngrade`.
+- **Attestor:** dirección inmutable fijada en el constructor (`attestor()`). Es
+  la única llave que autoriza un tier; rotarla exige redeploy.
+- **Firma EIP-712:** dominio `("BlioCheckoutIntegrator", "1", chainId,
+  address(this))`; tipo
+  `Attestation(address user,uint8 tier,bytes32 nullifier,uint256 deadline)`.
+- **Envío:** `submitLivenessAttestation(user, tier, nullifier, deadline,
+  signature)` puede enviarla cualquiera (un relayer paga el gas); autoriza la
+  firma, no `msg.sender`.
+- **`deadline`:** cota de frescura del claim. No puede superar
+  `block.timestamp + MAX_ATTESTATION_DEADLINE` (15 minutos); un deadline lejano
+  o `type(uint256).max` revierte con `DeadlineTooFar`.
+- **TTL del tier:** tras `attestedAt`, el tier dura `ATTESTATION_TTL` (180 días,
+  expuesto en `attestationExpiresAt`). Al vencer, `_tierOf` devuelve `None`
+  (límite cero y `NotAttested` al colocar) y el comprador debe re-attestarse.
+- **`nullifier`:** de un solo uso (`usedNullifier`); no se puede replicar, ni
+  para otra wallet u otro tier (`NullifierUsed`).
+
+### 4.2 Allowlist de monedas
+
+`allowedCurrency` solo admite etiquetas exactas aprobadas por el owner
+(`setCurrencyAllowed(bytes32,bool)`, evento `CurrencyAllowlistUpdated`). El
+constructor habilita `bytes32("INR")` y el comodín `bytes32(0)` (OTHER); cualquier
+otra moneda (BRL/PIX/…) debe habilitarse explícitamente. Una etiqueta no
+permitida revierte `CurrencyNotAllowed` en `userPlaceOrder` y en
+`validateOrder`, lo que bloquea alias como `keccak("INR")`, `"inr"` o `"INR "`
+que antes caían en el bucket OTHER.
 
 ## 5. Callbacks
 
@@ -217,7 +259,7 @@ function onOrderCancel(uint256 orderId) external;
 ```
 
 - Se invoca al cancelar un BUY (manual, expiración, disputa o fallo de PAY).
-- El gateway lo envuelve en `try/catch`: **revertir es seguro para el protocolo**, pero se pierde la liberación de contabilidad del integrador.
+- El gateway lo envuelve en `try/catch`: **revertir es seguro para el protocolo**, pero se pierde la marca `cancelled` y el evento; el cupo no se libera (por diseño).
 - Evidencia: `MockDiamond.sol:424-441`, `IP2PIntegrator.sol:23-31`.
 - **No se invoca por defecto.** El callback es opt-in y por integrador:
   - `MockDiamond.sol:769-782` lo dice explícitamente: el comportamiento real por defecto es cancelar sin llamar al integrador; `setIntegratorCancelCallback` es opt-in y arranca en `false`.
@@ -228,16 +270,17 @@ Blio (`BlioCheckoutIntegrator.sol:436-452`):
 
 - Solo el Diamond.
 - Ignora sesiones inexistentes, fulfilled o ya cancelled.
-- Marca `cancelled = true`.
-- Devuelve el slot del día usando el `placementDay` guardado al colocar (no el día actual).
-- Emite `BlioOrderCancelled`.
+- Marca `cancelled = true` y emite `BlioOrderCancelled`.
+- **No libera el cupo diario.** El contador mide colocaciones, no liquidaciones:
+  cancelar o reintentar consume el cupo del día. Es coherente con
+  `cancelCallbackEnabled = false`, que puede no invocar el hook.
 
 ### 5.3 ¿Revertir rompe algo?
 
 | Callback | ¿Revertir rompe el protocolo? | ¿Qué se pierde? |
 | --- | --- | --- |
 | `onOrderComplete` | **No.** El Diamond lo captura con `try/catch`; la liquidación y el estado de la orden ya finalizaron. | El evento `BlioOrderCompleted` y el `fulfilled = true`. blio no concede Premium y la sesión queda abierta. |
-| `onOrderCancel` | **No.** También va en `try/catch`. | La liberación del slot diario / contabilidad del integrador. |
+| `onOrderCancel` | **No.** También va en `try/catch`. | La marca `cancelled` y `BlioOrderCancelled`; el cupo diario no se libera (se consume al colocar). |
 
 Por eso blio implementa ambos sin revertir y con guards de idempotencia. Aun así, un fallo del callback no se reintenta: el integrador debe ser lo más simple posible y el backend debe alertar por anomalías.
 
@@ -266,7 +309,7 @@ Por eso blio implementa ambos sin revertir y con guards de idempotencia. Aun as�
 ### Implicaciones
 
 - **Safe directa:** el USDC llega a la Safe; no hace falta que implemente `receive()` para ERC-20. Para moverlo hay que proponer/ejecutar una transacción Safe.
-- **Diseño vigente (Fase 3):** el USDC llega **directo a la Safe de blio** (`0xFB25…`, v1.5.0 2-de-3), que es el `treasury` inmutable del integrador. No hay contrato intermedio, ni reparto, ni afiliados. El integrador nunca custodia fondos.
+- **Diseño vigente (Fase 3):** el USDC llega **directo a la Safe de blio** (`0xFB25…`, v1.5.0 2-de-3), que es el `treasury` inmutable del integrador. No hay contrato intermedio ni reparto; el integrador nunca custodia fondos.
 - **Riesgo si se registra `usdcThroughIntegrator = true`:** el USDC iría al integrador, no al `recipientAddr`. Blio lo detectaría con `SettlementRoutingAnomaly`, pero el dinero quedaría atrapado hasta que el owner recupere los tokens extraviados. El registro correcto es **`false`**, y así están v1 y v2.
 
 ## 7. Eventos necesarios para conceder Premium
@@ -306,7 +349,7 @@ event BlioOrderCreated(
 - Topic0: `0xfcddda00840a4d79eb5443493831cf41186b28fd59f5ea5a0a1d0a9216dd2497`.
 - Útil para conciliación y para el widget (leer `productId`/`quantity` de un solo recibo), **no** para conceder Premium.
 
-### 7.3 `BlioOrderCancelled` — liberar estado
+### 7.3 `BlioOrderCancelled` — marca de cancelación (no libera cupo)
 
 ```solidity
 event BlioOrderCancelled(uint256 indexed orderId, address indexed user);
@@ -314,7 +357,7 @@ event BlioOrderCancelled(uint256 indexed orderId, address indexed user);
 
 - Fuente: `:89`; emisión `:451`.
 - Topic0: `0x3bcf9740e40f2801ad9f92db36504cacd6508097a685cde5c92d4e93e136f934`.
-- Solo se emite si el Diamond invoca `onOrderCancel`, lo que hoy **no ocurre** porque `cancelCallbackEnabled = false` en v1 y v2.
+- Solo se emite si el Diamond invoca `onOrderCancel`, lo que hoy **no ocurre** porque `cancelCallbackEnabled = false`. Aun si llegara, solo marca la sesión: no devuelve el cupo diario.
 
 ### 7.4 `SettlementRoutingAnomaly` — alerta, no concesión
 
@@ -346,50 +389,39 @@ event SettlementRoutingAnomaly(
 
 ## 8. Inventario del PR / rama
 
-`git diff --numstat main...HEAD` (solo adiciones, 1.284 líneas):
+| Archivo | Propósito |
+| --- | --- |
+| `contracts/integrators/blio/BlioCheckoutIntegrator.sol` | Integrador de checkout: productos, límites por moneda/tier, attestation, `UserProxy`, cupo diario, callbacks y eventos. |
+| `docs/integrators/blio.md` | Documentación operativa del integrador (Sepolia, mainnet y Safe). |
+| `scripts/deploy-blio.ts` | Deploy + presets 8453/84532 + registro con ABI por red + verificación de config. |
+| `scripts/set-blio-products.ts` | Configuración idempotente de productos 1..4: directo (Sepolia EOA) o batch Safe. |
+| `test/blio-integrator.test.ts` | Suite del integrador contra `MockDiamond` (attestation, límites, cupo, Safe, reentrancy). |
+| `test/blio-integrator-poc.test.ts` | PoC del revisor sobre el gate de attestation. |
 
-| Archivo | Líneas añadidas | Propósito |
-| --- | ---: | --- |
-| `contracts/integrators/blio/BlioCheckoutIntegrator.sol` | 534 | Integrador de checkout de blio: productos, límites, `UserProxy`, callbacks y eventos. |
-| `contracts/integrators/blio/` (tesorería intermedia) | 118 | **Eliminado en Fase 3**; la Safe es ahora el destino directo. |
-| `docs/integrators/blio.md` | 80 | Documentación operativa del integrador. |
-| `scripts/deploy-blio.ts` | 229 | Deploy + registro en el Diamond (`usdcThroughIntegrator = false`) + verificación de config. |
-| `scripts/set-blio-products.ts` | 95 | Configuración idempotente de productos 1..4. |
-| `test/blio-integrator.test.ts` | 228 | 19 tests del integrador contra `MockDiamond`. |
-
-Commits de la rama:
-
-```text
-21217e8 chore(blio): script de productos + baseTxLimit 100 en deploy
-14dae14 feat(blio): contrato intermedio de tesorería (eliminado en Fase 3)
-9e94605 fix(blio): add immutable MAX_ ceilings on owner-settable limits
-f62d41f feat(integrator): add BlioCheckoutIntegrator
-```
-
-No se tocaron otros archivos del repo.
+La tesorería intermedia no forma parte de esta rama: fue eliminada en la Fase 3.
+Esta revisión se apoya en `7037b8c` (allowlist de monedas y TTL/deadline de
+attestation).
 
 ## 9. Baseline de pruebas
 
-Comando ejecutado (no hay `npm` usable en el servidor porque `/usr/local/lib/node_modules/npm` es `root:root 750`):
+El baseline de **19 tests** de la Fase 0 quedó obsoleto. La rama añadió
+attestation (firma EIP-712, dominio, replay del nullifier, deadline, tier
+inválido, downgrade, relayer, comprador sin attestation), límites por moneda y
+nivel, cupo diario, Safe/contrato como treasury, reentrancy, idempotencia y
+footprint. La suite declara **61 casos** en `test/blio-integrator.test.ts` y
+**3** en `test/blio-integrator-poc.test.ts`; el número de "passing" se obtiene
+ejecutando:
 
 ```bash
 cd /home/xolvora/p2p/payment-integrators
-node ./node_modules/hardhat/internal/cli/cli.js test test/blio-integrator.test.ts
+node ./node_modules/hardhat/internal/cli/cli.js test \
+  test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 ```
 
-Resultado:
-
-```text
-19 passing (3s)
-```
-
-Es exactamente el baseline esperado: **19/19**.
-
-Suite completa (referencia):
+Suite completa (referencia; el conteo cambia con el repo):
 
 ```bash
 node ./node_modules/hardhat/internal/cli/cli.js test
-# 986 passing (3m), 45 pending
 ```
 
 Equivalentes habituales si `npm`/`npx` funcionan:
@@ -397,24 +429,29 @@ Equivalentes habituales si `npm`/`npx` funcionan:
 ```bash
 npm test
 # o
-npx hardhat test test/blio-integrator.test.ts
+npx hardhat test test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 ```
 
-### Huecos de test relevantes
+### Cobertura actual
 
-- El test llamado “ignores cancel after completion” (`test/blio-integrator.test.ts:142-148`) **no llama** a `onOrderCancel`; solo comprueba que un segundo `simulateOrderComplete` revierte. No cubre el caso cancel-after-complete.
-- No hay test del comportamiento real por defecto `cancelCallbackEnabled = false` usando `simulateOrderCancelledNoCallback`.
-- No hay test con `recipientAddr` siendo un contrato (Safe); solo EOA (`treasury` signer).
-- No hay test de `configReadable = false` (fallback por balance).
+- **Attestation:** firma válida/inválida, dominio incorrecto, replay de
+  `nullifier`, `deadline` vencido o demasiado lejano, TTL del tier, tier
+  inválido, downgrade, relayer y comprador sin attestation.
+- **Cancelación:** con `cancelCallbackEnabled = false`, una orden cancelada sin
+  callback puede completarse y emitir Premium; el cupo no se libera.
+- **Treasury:** EOA y contrato tipo Safe.
+- **Límites y monedas:** 20/50/100/200 por moneda y tier, allowlist de etiquetas
+  exactas y el sexto intento del día.
+- **Reentrancy**, idempotencia de `onOrderComplete` y footprint EIP-170.
 
 ## 10. Restricciones técnicas
 
 | Restricción | Valor / estado |
 | --- | --- |
 | Límite de runtime (EIP-170) | **24.576 bytes** |
-| Runtime de `BlioCheckoutIntegrator` | **7.400 bytes** (mucho margen) |
+| Runtime de `BlioCheckoutIntegrator` | **9.725 bytes** (mucho margen) |
 | Runtime del contrato de tesorería intermedio | **eliminado en Fase 3** |
-| Initcode de `BlioCheckoutIntegrator` | **11.413 bytes** (límite EIP-3860: 49.152) |
+| Initcode de `BlioCheckoutIntegrator` | **14.029 bytes** (límite EIP-3860: 49.152) |
 | Solidity | Compilador **0.8.28**; pragma del contrato `^0.8.20` |
 | Settings | `evmVersion: "cancun"`, `viaIR: true`, optimizer `enabled`, `runs: 200` |
 | OpenZeppelin | **5.6.1** instalado (`package.json`: `^5.0.1`) |
@@ -424,8 +461,9 @@ npx hardhat test test/blio-integrator.test.ts
 | `Clones` | Disponible e importado (`:9`) |
 | `UserProxy` | Usa `transient` (EIP-1153); requiere Cancun, que Base soporta (`UserProxy.sol:64-74`) |
 | Upgradeability | No hay. `diamond`, `usdc`, `proxyImpl` y `treasury` son `immutable`; `proxyImpl` es set-once en el Diamond |
-| Límites duros del integrador | `MAX_BASE_TX_LIMIT = 5.000e6` (5.000 USDC), `MAX_DAILY_TX_COUNT_LIMIT = 100` (`BlioCheckoutIntegrator.sol:117-118`) |
-| Registro | `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)`; `proxyImpl` set-once (`docs/WHITELISTING.md:58-62`) |
+| Límites duros del integrador | `MAX_TX_LIMIT_INR_LIVENESS = 20e6`, `MAX_TX_LIMIT_INR_PASSPORT = 100e6`, `MAX_TX_LIMIT_OTHER_LIVENESS = 50e6`, `MAX_TX_LIMIT_OTHER_PASSPORT = 200e6`; `MAX_DAILY_TX_COUNT_LIMIT = 5` |
+| Registro | Base Sepolia: `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)` (3 args); Base mainnet: 4.º `cancelCallbackEnabled`. `proxyImpl` set-once (`docs/WHITELISTING.md:58-62`) |
+| Allowlist de monedas | `allowedCurrency`; constructor habilita INR y OTHER; `setCurrencyAllowed` `onlyOwner` |
 
 El límite de 24.576 bytes es el que ya obliga a `MerchantTerminalIntegrator` a usar `runs: 50` (`hardhat.config.ts:80-100`). Blio está muy por debajo, así que el rediseño puede añadir lógica sin acercarse al límite, salvo que se incorporen librerías grandes.
 
@@ -433,13 +471,13 @@ El límite de 24.576 bytes es el que ya obliga a `MerchantTerminalIntegrator` a 
 
 1. **La dirección v1 del encargo es incorrecta.** `0x63460ae9552e0b7c3c1b4f4dcd2c4f7f0b1a6e5b` no tiene código. La real es `0x63460ae9566e9274d0034636B85243c216F2FD73`. Cualquier script o verificación que use la primera fallará o leerá vacío.
 
-2. **v1 usa una EOA como tesorería y como owner.** `0xb975…` tiene 0 bytes de código y es a la vez `treasury` y `owner`. La documentación (`docs/integrators/blio.md:61-62`) dice que ambos “deberían ser el multisig de blio”; el despliegue v1 no lo cumple. v2 usó un contrato intermedio + Safe v1.5.0 2-de-3; la v3 apunta directo a la Safe, sin contrato intermedio.
+2. **v1 usa una EOA como tesorería y como owner.** `0xb975…` tiene 0 bytes de código y es a la vez `treasury` y `owner`. La documentación operativa dice que ambos “deberían ser el multisig de blio”; el despliegue v1 no lo cumple. v2 usó un contrato intermedio + Safe v1.5.0 2-de-3; la v3 apunta directo a la Safe, sin contrato intermedio.
 
-3. **`cancelCallbackEnabled = false` en v1 y v2.** En producción, el Diamond **no llama** `onOrderCancel` al cancelar un BUY. Consecuencia: el slot diario que `validateOrder` consumió no se libera en cancelaciones/expirables. El mock de tests sí llama al callback (`simulateOrderCancelled`), por lo que el test pasa pero no refleja el comportamiento real. Si el rediseño depende de `onOrderCancel`, hay que pedir al super-admin:
-   ```text
-   setIntegratorCancelCallback(<integrator>, true)
-   ```
-   o implementar reconciliación por `getOrdersById`/expiración en el backend.
+3. **`cancelCallbackEnabled = false` es intencional.** En producción el Diamond
+   puede no llamar `onOrderCancel` al cancelar un BUY. El cupo diario se consume
+   al **colocar** (`validateOrder`), no al liquidar, así que cancelar o
+   reintentar no lo devuelve. No hace falta `setIntegratorCancelCallback`; si el
+   backend necesita bookkeeping, reconcilia por `getOrdersById`/expiración.
 
 4. **`SettlementRoutingAnomaly` no reintenta ni resuelve.** Deja la sesión sin `fulfilled` y sin `BlioOrderCompleted`. El backend debe alertar y resolver manualmente (o con un job de reconciliación). No se debe conceder Premium por `BlioOrderCreated`.
 
@@ -449,7 +487,7 @@ El límite de 24.576 bytes es el que ya obliga a `MerchantTerminalIntegrator` a 
 
 7. **El struct de `getIntegratorConfig` puede volver a crecer.** El contrato de blio lee el word 1 crudo y sobrevive a inserciones en medio; cualquier script que use un ABI tipado fijo se romperá silenciosamente. Mantener el decode por forma de `scripts/lib/diamond.ts`.
 
-8. **`usdcThroughIntegrator` puede re-afirmarse con `registerIntegrator`** (mismo `proxyImpl`). Un registro erróneo a `true` enviaría el USDC al integrador, no al treasury. Blio lo detecta, pero no lo recupera automáticamente. Hay que verificar el flag después de cada registro (el deploy script ya lo hace: `scripts/deploy-blio.ts:194-203`).
+8. **`usdcThroughIntegrator` puede re-afirmarse con `registerIntegrator`** (mismo `proxyImpl`). Un registro erróneo a `true` enviaría el USDC al integrador, no al treasury. Blio lo detecta, pero no lo recupera automáticamente. Hay que verificar el flag después de cada registro (el deploy script lo hace con `registerIntegrator` + `getIntegratorConfig`).
 
 9. **El token de pruebas no es el USDC de mainnet.** En Base Sepolia el token usado es `GG` (6 dec). No copiar direcciones de token entre redes.
 
@@ -507,7 +545,7 @@ cast call 0x239dd5df6f460c7df65072b0483e0fbf009f04a3 "dailyTxCountLimit()(uint25
 ## 13. Decisiones que debe cerrar la Fase 1
 
 1. **Destino de tesorería (cerrado):** **Safe de blio directa** (`0xFB25…`), inmutable del constructor. Sin contrato intermedio ni reparto; mover fondos exige una transacción Safe.
-2. **Cancel callback:** pedir `setIntegratorCancelCallback(<nuevo integrator>, true)` o aceptar el leak de slots y reconciliar por backend.
-3. **Contrato nuevo vs reutilizar v2:** se despliega un integrador nuevo. El v2 usaba un contrato intermedio; en v3 `treasury` y `owner` son inmutables y apuntan a la Safe, así que cambiar de tesorería exige otro despliegue.
+2. **Cancel callback (cerrado):** se mantiene `false`; el cupo es por colocación y no se libera. El backend reconcilia cancelaciones/expirables por `getOrdersById` si lo necesita.
+3. **Contrato nuevo vs reutilizar v2:** se despliega un integrador nuevo. El v2 usaba un contrato intermedio; en v3 `treasury` es inmutable y apunta a la Safe, mientras que `owner` es transferible (`Ownable2Step`). Cambiar de tesorería exige otro despliegue.
 4. **Indexación:** consumir `BlioOrderCompleted` con idempotencia por `orderId` y alerta por `SettlementRoutingAnomaly`; no conceder Premium por `BlioOrderCreated`.
 5. **Comprador:** mantener EOA/proxy como `user` para que `paidBuyOrder`/`cancelOrder` sigan siendo ejecutables; si se usa Safe/smart account, diseñar ese flujo explícitamente.

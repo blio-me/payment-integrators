@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import type { TransactionResponse } from "ethers";
 import { getIntegratorConfig } from "./lib/diamond";
 
 /**
@@ -18,11 +19,17 @@ import { getIntegratorConfig } from "./lib/diamond";
  *
  * ── Registration is opt-in ────────────────────────────────────────────────
  * The Diamond registry is owned by the p2p admin. By default this script only
- * deploys; pass `--register` to submit `registerIntegrator` from the current
- * signer. The live Diamond's selector is
- * `registerIntegrator(address,bool,address,bool)`, which sets the 5-word
- * IntegratorConfig (isActive, usdcThroughIntegrator, cancelCallbackEnabled,
- * activeOrderCount, proxyImpl). `cancelCallbackEnabled` stays false.
+ * deploys; pass `REGISTER=1` to submit `registerIntegrator` from the current
+ * signer. The ABI differs by network:
+ *
+ *   - Base mainnet: `registerIntegrator(address,bool,address,bool)` (4 args;
+ *     the last one is `cancelCallbackEnabled`).
+ *   - Base Sepolia: `registerIntegrator(address,bool,address)` (3 args; the
+ *     deployed facet predates `cancelCallbackEnabled`).
+ *
+ * The script picks the signature for the connected chain and falls back to the
+ * other one if the call fails before a transaction is submitted. Afterwards it
+ * reads `getIntegratorConfig` and asserts `cancelCallbackEnabled = false`.
  *
  * ── Owner + recipient ─────────────────────────────────────────────────────
  * `owner` (limits, products, pause) and `treasury` (settlement destination)
@@ -32,7 +39,7 @@ import { getIntegratorConfig } from "./lib/diamond";
  * Usage:
  *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] \
  *   [RECIPIENT_ADDR=0x...] ATTESTOR=0x... [DEPLOY_OWNER=0x...] \
- *   [DAILY_TX_COUNT_LIMIT=5] [DRY_RUN=1] [--register] \
+ *   [DAILY_TX_COUNT_LIMIT=5] [DRY_RUN=1] [REGISTER=1] \
  *   npx hardhat run scripts/deploy-blio.ts --network base
  */
 
@@ -61,15 +68,23 @@ const PRESETS: Record<
     usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     recipient: BLIO_SAFE,
   },
-  84532: { label: "Base Sepolia" },
+  84532: {
+    label: "Base Sepolia",
+    diamond: "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9",
+    usdc: "0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d",
+  },
 };
 
 const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || DEFAULT_DAILY_TX_COUNT_LIMIT;
-const REGISTER = process.argv.includes("--register");
+const REGISTER = process.env.REGISTER === "1" || process.argv.includes("--register");
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
-const REGISTER_ABI = [
+const REGISTER_ABI_4 = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl, bool cancelCallbackEnabled)",
+];
+
+const REGISTER_ABI_3 = [
+  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
 ];
 
 const ERC20_ABI = [
@@ -223,7 +238,6 @@ async function main() {
   let cfg = null;
   if (REGISTER) {
     console.log("\nRegistering on the Diamond (usdcThroughIntegrator=false)…");
-    const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
     const before = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     if (
       before.proxyImpl !== ethers.ZeroAddress &&
@@ -231,7 +245,47 @@ async function main() {
     ) {
       throw new Error(`proxyImpl already locked to ${before.proxyImpl}; refusing to re-register`);
     }
-    const tx = await b2b.registerIntegrator(integratorAddr, false, proxyImpl, false);
+
+    const b2b4 = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI_4, deployer);
+    const b2b3 = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI_3, deployer);
+    const attempts =
+      chainId === 84532
+        ? [
+            {
+              label: "3-arg (Base Sepolia)",
+              send: () => b2b3.registerIntegrator(integratorAddr, false, proxyImpl),
+            },
+            {
+              label: "4-arg (fallback)",
+              send: () => b2b4.registerIntegrator(integratorAddr, false, proxyImpl, false),
+            },
+          ]
+        : [
+            {
+              label: "4-arg (Base mainnet)",
+              send: () => b2b4.registerIntegrator(integratorAddr, false, proxyImpl, false),
+            },
+            {
+              label: "3-arg (fallback)",
+              send: () => b2b3.registerIntegrator(integratorAddr, false, proxyImpl),
+            },
+          ];
+
+    let tx: TransactionResponse | undefined;
+    const errors: string[] = [];
+    for (const attempt of attempts) {
+      try {
+        tx = await attempt.send();
+        console.log(`  registerIntegrator ABI: ${attempt.label}`);
+        break;
+      } catch (e) {
+        errors.push(`${attempt.label}: ${(e as Error).message}`);
+        warn(`${attempt.label} failed: ${(e as Error).message}`);
+      }
+    }
+    if (!tx) {
+      throw new Error(`registerIntegrator failed with both ABIs:\n${errors.join("\n")}`);
+    }
     await tx.wait(1);
     console.log("  registerIntegrator tx:", tx.hash);
 

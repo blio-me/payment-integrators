@@ -10,11 +10,14 @@ which consumes `BlioOrderCompleted`.
 - **Diamond:** `0x4cad6eC90e65baBec9335cAd728DDC610c316368` (Base mainnet) ·
   `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` (Base Sepolia)
 - **USDC (Base):** `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+- **Settlement token (Base Sepolia):** `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d`
+  (`GG` mock, 6 decimals — the token the Sepolia Diamond settles in; it is
+  **not** Circle USDC)
 - **Recipient / treasury:** `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` (blio Safe)
 
 ## Architecture
 
-There is no intermediate vault and no revenue-share layer. Every order pins
+Settlement is direct: there is no intermediate contract, no revenue-share layer and no custody. Every order pins
 `recipientAddr` to the immutable Safe, so the USDC transfer from the Diamond
 goes **straight to the Safe** and the integrator never holds user funds.
 
@@ -38,7 +41,9 @@ not an on-chain token.
 
 Products are `productId`s with a USDC price set by the owner
 (`setProductPrice`, `setProductActive`). blio uses `productId` 1–4 for its
-Premium plans.
+Premium plans. On mainnet the owner is the blio Safe, so those calls are queued
+as a Safe Transaction Builder batch; direct EOA execution is only supported on
+Base Sepolia with an EOA owner (see **Configure products** below).
 
 Per-transaction ceilings are compiled into the bytecode and seeded in the
 constructor. The owner may only tighten them, never raise them:
@@ -185,32 +190,72 @@ event — reconcile manually and alert.
   `user` must remain the account that can sign `paidBuyOrder` / `cancelOrder`.
 - **Registration is admin-gated.** `registerIntegrator` is
   `onlySuperAdmin`; the p2p admin performs it, or the deployer may use
-  `--register` when it holds that role.
+  `REGISTER=1` when it holds that role. Base Sepolia exposes the 3-argument
+  form `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)`;
+  Base mainnet exposes the 4-argument form with `cancelCallbackEnabled`. The
+  deploy script selects the right ABI for the chain and falls back to the other
+  signature if the call fails before submission.
 
 ## Deploy
 
+Base Sepolia (`84532`) and Base mainnet (`8453`) presets supply `DIAMOND_ADDRESS`
+and `USDC_ADDRESS`, so they are not needed in the command. On Sepolia the
+settlement token is the `GG` mock above, not Circle USDC.
+
 ```bash
-# Deploy only (registration left to the p2p admin):
+# Base Sepolia — use test accounts for recipient/owner; presets fill Diamond + USDC.
+RECIPIENT_ADDR=0xYourSepoliaTestAccount \
+ATTESTOR=0xYourAttestorSigner \
+DEPLOY_OWNER=0xYourSepoliaTestAccount \
+  npx hardhat run scripts/deploy-blio.ts --network baseSepolia
+
+# Base mainnet — recipient and owner are the blio Safe.
 RECIPIENT_ADDR=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
 ATTESTOR=0x... DEPLOY_OWNER=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
-  npx hardhat run scripts/deploy-blio.ts --network baseSepolia   # then --network base
+  npx hardhat run scripts/deploy-blio.ts --network base
 
-# Deploy and register (requires the Diamond super-admin key):
-RECIPIENT_ADDR=0x... ATTESTOR=0x... DEPLOY_OWNER=0x... \
-  npx hardhat run scripts/deploy-blio.ts --network base --register
+# Deploy and register (requires the Diamond super-admin key; REGISTER=1 because
+# Hardhat rejects custom --flags):
+RECIPIENT_ADDR=0x... ATTESTOR=0x... DEPLOY_OWNER=0x... REGISTER=1 \
+  npx hardhat run scripts/deploy-blio.ts --network baseSepolia
 ```
 
-Defaults: `DAILY_TX_COUNT_LIMIT=5` and the 20/50/100/200 matrix. On Base
-mainnet `RECIPIENT_ADDR` defaults to the blio Safe. `TREASURY` is accepted as a
-legacy alias. The script verifies the limits on-chain after deployment, warns
-if `usdcThroughIntegrator` is ever observed as non-false, and prints both the
+Add `DRY_RUN=1` to run the preflight without deploying. Defaults:
+`DAILY_TX_COUNT_LIMIT=5` and the 20/50/100/200 matrix. On Base mainnet
+`RECIPIENT_ADDR` defaults to the blio Safe. `TREASURY` is accepted as a legacy
+alias. The script verifies the limits on-chain after deployment, checks that
+`cancelCallbackEnabled` stays `false` after registration, warns if
+`usdcThroughIntegrator` is ever observed as non-false, and prints both the
 Etherscan and Blockscout verification commands.
 
-Then configure the products (idempotent, `onlyOwner`):
+## Configure products
+
+`set-blio-products.ts` is idempotent: it only queues calls whose on-chain value
+differs from the target. `MODE=safe` writes a Safe Transaction Builder JSON;
+`MODE=direct` sends the transactions and is refused on mainnet or when the
+owner has code.
 
 ```bash
-INTEGRATOR=0x... npx hardhat run scripts/set-blio-products.ts --network base
+# Base Sepolia, owner = EOA signer
+INTEGRATOR=0x... MODE=direct \
+  npx hardhat run scripts/set-blio-products.ts --network baseSepolia
+
+# Base mainnet, owner = blio Safe
+INTEGRATOR=0x... MODE=safe \
+  npx hardhat run scripts/set-blio-products.ts --network base
 ```
+
+The mainnet command writes `blio-products-safe-8453.json` (override with
+`SAFE_BATCH_OUT`). Pass `SAFE_ADDRESS=0x...` to assert it matches `owner()`.
+Then:
+
+1. Open the blio Safe → **Apps → Transaction Builder**.
+2. Load/import the JSON batch (it contains up to 8 calls: price + activation per
+   product, only for values that differ).
+3. Review the decoded `setProductPrice` / `setProductActive` calls.
+4. Collect the Safe signatures and execute.
+5. Re-run the same `MODE=safe` command: it should report that nothing is left
+   to change (and generate no batch).
 
 ## Off-chain integration
 
@@ -223,11 +268,11 @@ INTEGRATOR=0x... npx hardhat run scripts/set-blio-products.ts --network base
 
 ## What changed from the previous version
 
-- The **intermediate treasury contract** (vault) was removed. The Safe is the
+- The previous **intermediate treasury contract** was removed. The Safe is the
   immutable `treasury`, so settlement is a single direct USDC transfer.
-- **Revenue-share / partner split** logic was removed, along with its
+- The **revenue-share layer** was removed, along with its
   parameters and deploy steps.
 - No order funds ever pass through the integrator or the `UserProxy`; the only
   USDC recovery lever is for stray tokens, not a withdrawal path.
-- The deploy script no longer configures vault or partner addresses, and
+- The deploy script no longer configures intermediate-treasury addresses, and
   defaults to the 20/50/100/200 limits with 5 placements per day.
