@@ -17,20 +17,28 @@ import { getIntegratorConfig } from "./lib/diamond";
  *
  * ── Owner + treasury ──────────────────────────────────────────────────────
  * `owner` (limits, products, pause, sweep) and `treasury` (settlement
- * destination) should both be the blio multisig. On mainnet the script refuses
- * to default either to the deployer EOA.
+ * destination) should both be the blio multisig. On mainnet the treasury
+ * defaults to the blio Safe and the script refuses to default the owner to the
+ * deployer EOA. There is no vault and no affiliate split: the Safe is the
+ * direct, immutable settlement destination.
  *
  * Usage:
- *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] TREASURY=0x... ATTESTOR=0x... \
+ *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] [TREASURY=0x...] ATTESTOR=0x... \
  *   [DEPLOY_OWNER=0x...] [DAILY_TX_COUNT_LIMIT=5] [SKIP_REGISTER=false] [DRY_RUN=1] \
  *   npx hardhat run scripts/deploy-blio.ts --network base
  */
 
-const PRESETS: Record<number, { label: string; diamond?: string; usdc?: string }> = {
+const BLIO_SAFE = "0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47";
+
+const PRESETS: Record<
+  number,
+  { label: string; diamond?: string; usdc?: string; treasury?: string }
+> = {
   8453: {
     label: "Base mainnet",
     diamond: "0x4cad6eC90e65baBec9335cAd728DDC610c316368",
     usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    treasury: BLIO_SAFE,
   },
   84532: { label: "Base Sepolia" },
 };
@@ -75,7 +83,7 @@ async function main() {
 
   const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || preset.diamond || "";
   const USDC_ADDRESS = process.env.USDC_ADDRESS || preset.usdc || "";
-  const TREASURY = process.env.TREASURY || "";
+  const TREASURY = process.env.TREASURY || preset.treasury || "";
   const ATTESTOR = process.env.ATTESTOR || "";
   const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer.address;
 

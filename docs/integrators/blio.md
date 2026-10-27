@@ -51,15 +51,20 @@ fulfil — if a mis-registration ever routes settlement back to the integrator.
 
 Standard, no RP ladder:
 
-- Per-tx cap: `baseTxLimit` (6-dec USDC), optionally tightened per currency via
-  `maxTxLimit[currency]`.
-- Daily count: `dailyTxCountLimit` placements per user per UTC day, released on
-  cancellation (keyed on the placement-day snapshot).
+- Per-tx cap: immutable ceiling by currency class and attestation tier
+  (`INR` vs. the rest, liveness vs. passport), optionally tightened by the owner
+  below that ceiling.
+- Daily count: `dailyTxCountLimit` placements per user per UTC day. The counter
+  measures **placements**, so a cancellation does **not** release the slot (and
+  the gateway may never call `onOrderCancel` when `cancelCallbackEnabled` is
+  false).
 
 ## Operational notes
 
 - **`owner`** controls products, limits, pause and `sweepUsdc`; **`treasury`**
-  receives settlement. Both should be the **blio multisig**.
+  receives settlement. Both should be the **blio multisig/Safe**
+  (`0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47`). There is no vault and no
+  affiliate split.
 - Product prices are set per deployment/chain — remember to `setProductActive`
   after `setProductPrice`.
 - **Off-chain fulfilment:** an indexer must map `BlioOrderCompleted(orderId,
@@ -72,9 +77,10 @@ quantity`. The widget decodes the order id from `BlioOrderCreated` (or falls
 ## Deploy
 
 ```bash
-TREASURY=0x... DEPLOY_OWNER=0x... BASE_TX_LIMIT=50000000 DAILY_TX_COUNT_LIMIT=10 \
+TREASURY=0x... DEPLOY_OWNER=0x... ATTESTOR=0x... DAILY_TX_COUNT_LIMIT=5 \
   npx hardhat run scripts/deploy-blio.ts --network baseSepolia   # then --network base
 ```
 
-The script asserts `usdcThroughIntegrator == false` after registration and
-prints the verify command.
+On Base mainnet `TREASURY` defaults to the blio Safe. The script asserts
+`usdcThroughIntegrator == false` after registration and prints the verify
+command.

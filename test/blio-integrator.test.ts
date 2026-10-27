@@ -1,5 +1,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
+import * as fs from "fs";
+import * as path from "path";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import type { Wallet } from "ethers";
 
@@ -267,19 +269,72 @@ describe("BlioCheckoutIntegrator", function () {
   });
 
   describe("Cancellation", function () {
-    it("releases the daily-count slot on cancel", async function () {
+    it("does not release the daily-count slot on cancel", async function () {
       await place(user, 1);
       expect(await integrator.getTodayCount(user.address)).to.equal(1);
       await mockDiamond.simulateOrderCancelled(1);
-      expect(await integrator.getTodayCount(user.address)).to.equal(0n);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
       expect((await integrator.getSession(1)).cancelled).to.equal(true);
     });
 
-    it("ignores cancel after completion", async function () {
+    it("does not release the slot when the cancel callback never fires", async function () {
+      await place(user, 1);
+      await mockDiamond.simulateOrderCancelledNoCallback(1);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+    });
+
+    it("completes a cancelled-and-reopened order (bug 4.1)", async function () {
+      await place(user, 2);
+      const before = await mockUsdc.balanceOf(treasury.address);
+
+      await mockDiamond.simulateOrderCancelled(1);
+      expect((await integrator.getSession(1)).cancelled).to.equal(true);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+
+      // A CANCELLED BUY is not terminal: the protocol can re-open it and
+      // complete it. Premium must still be granted and the Safe must be paid.
+      await expect(mockDiamond.simulateOrderComplete(1))
+        .to.emit(integrator, "BlioOrderCompleted")
+        .withArgs(1, user.address, PRODUCT_ID, 2, USDC(20));
+
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(before + USDC(20));
+      const session = await integrator.getSession(1);
+      expect(session.fulfilled).to.equal(true);
+      expect(session.cancelled).to.equal(true);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+    });
+
+    it("rejects a cancel after completion at the Diamond", async function () {
       await place(user, 1);
       await mockDiamond.simulateOrderComplete(1);
       // second completion reverts at the Diamond (already completed)
       await expect(mockDiamond.simulateOrderComplete(1)).to.be.reverted;
+    });
+  });
+
+  describe("No vault or affiliate surface", function () {
+    it("exposes no affiliate or vault functions in the ABI", async function () {
+      const names = integrator.interface.fragments
+        .filter((f: any) => f.type === "function")
+        .map((f: any) => f.name);
+      for (const forbidden of [
+        "affiliate",
+        "affiliateBps",
+        "setAffiliate",
+        "distribute",
+        "sweep",
+        "vault",
+      ]) {
+        expect(names).to.not.include(forbidden);
+      }
+    });
+
+    it("has no vault source and no affiliate code", async function () {
+      const dir = path.join(__dirname, "..", "contracts", "integrators", "blio");
+      const src = fs.readFileSync(path.join(dir, "BlioCheckoutIntegrator.sol"), "utf8");
+      const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+      expect(code).to.not.match(/affiliate/i);
+      expect(fs.existsSync(path.join(dir, "BlioTreasuryVault.sol"))).to.equal(false);
     });
   });
 

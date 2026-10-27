@@ -1,5 +1,7 @@
 # Especificación verificada — integrador blio/p2p (Fase 0)
 
+> **Fase 3 (decisión final):** se eliminó el contrato de tesorería intermedio y todo lo relativo a afiliados. El diseño vigente es **`treasury` = Safe de blio (`0xFB25…`), inmutable del constructor, settlement directo, sin vault ni reparto**. Las referencias a v1/v2 de este documento son históricas.
+>
 > **Estado:** solo lectura. No se modificó código de contratos, no se desplegó nada y no se tocó `blio/apps/api`.
 >
 > **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD:** `21217e8`
@@ -31,7 +33,7 @@ Por tanto, la especificación combina **código del repo + comportamiento observ
 | `dailyTxCountLimit` | `10` | `100` |
 | `proxyImpl` | `0x71146B465CE3eEE05108D5f69d82BE92F85F8F64` | `0xC219b46bE7D8395Edbef12Fd78C20385da8a0783` |
 | `treasury()` | `0xb975Bc0b57B7E4adBE81E2412446390e66A66D33` | `0xd3704B0f3B869c238b2622C015Ec2f5Bb103e89A` |
-| Tipo de `treasury` | **EOA** (`eth_getCode = 0x`, 0 bytes) | **Contrato** `BlioTreasuryVault` (2.312 bytes) |
+| Tipo de `treasury` | **EOA** (`eth_getCode = 0x`, 0 bytes) | Contrato de tesorería (histórico v2; **eliminado en Fase 3**) |
 | `owner()` | `0xb975Bc0b57B7E4adBE81E2412446390e66A66D33` (misma EOA) | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` (**Safe v1.5.0, 2-de-3**) |
 | `paused()` | `false` | `false` |
 | USDC | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (`GG`, 6 dec) | mismo |
@@ -257,14 +259,14 @@ Por eso blio implementa ambos sin revertir y con guards de idempotencia. Aun as�
 - **v1 (EOA):** `treasury = 0xb975Bc0b57B7E4adBE81E2412446390e66A66D33`, `eth_getCode` = `0x` (0 bytes). Hay órdenes completadas y transferencias directas del Diamond a esa EOA. Ejemplos:
   - `BlioOrderCompleted` + `Transfer` del Diamond → `0xb975…` en `0x590fb6076593ef09d67b15187ba619114305456f1f53ec6a591c841a5a1c0343`.
   - `getOrdersById(803)`: `user = 0xb975…`, `recipientAddr = 0xb975…`, `status = 3` (COMPLETED).
-- **v2 (contrato):** `treasury = 0xd3704B0f3B869c238b2622C015Ec2f5Bb103e89A`, `BlioTreasuryVault` con 2.312 bytes de runtime. Hay transferencias directas del Diamond al vault. Ejemplo:
+- **v2 (histórico):** `treasury = 0xd3704B0f3B869c238b2622C015Ec2f5Bb103e89A`, un contrato de tesorería intermedio (eliminado en Fase 3). Hay transferencias directas del Diamond a ese contrato en v2. Ejemplo:
   - `BlioOrderCompleted` + `Transfer` del Diamond → `0xd370…` en `0x1fac1b097bfd1b6432b505710b6d8e3051ecc890cd5592b74f0733b56916ee13`.
   - `getOrdersById(915)`: `recipientAddr = 0xd370…`, `status = 3` (COMPLETED).
 
 ### Implicaciones
 
 - **Safe directa:** el USDC llega a la Safe; no hace falta que implemente `receive()` para ERC-20. Para moverlo hay que proponer/ejecutar una transacción Safe.
-- **Vault (`BlioTreasuryVault`):** el USDC llega al vault; `distribute()` es permissionless y envía todo el balance a `recipient` y al `affiliate` configurado. `recipient` y `owner` son la Safe v1.5.0 2-de-3 `0xFB25…`. El integrador nunca custodia fondos.
+- **Diseño vigente (Fase 3):** el USDC llega **directo a la Safe de blio** (`0xFB25…`, v1.5.0 2-de-3), que es el `treasury` inmutable del integrador. No hay contrato intermedio, ni reparto, ni afiliados. El integrador nunca custodia fondos.
 - **Riesgo si se registra `usdcThroughIntegrator = true`:** el USDC iría al integrador, no al `recipientAddr`. Blio lo detectaría con `SettlementRoutingAnomaly`, pero el dinero quedaría atrapado hasta un `sweepUsdc` del owner. El registro correcto es **`false`**, y así están v1 y v2.
 
 ## 7. Eventos necesarios para conceder Premium
@@ -349,7 +351,7 @@ event SettlementRoutingAnomaly(
 | Archivo | Líneas añadidas | Propósito |
 | --- | ---: | --- |
 | `contracts/integrators/blio/BlioCheckoutIntegrator.sol` | 534 | Integrador de checkout de blio: productos, límites, `UserProxy`, callbacks y eventos. |
-| `contracts/integrators/blio/BlioTreasuryVault.sol` | 118 | Vault de tesorería con `recipient`/`affiliate` configurables y `distribute()` permissionless. |
+| `contracts/integrators/blio/` (tesorería intermedia) | 118 | **Eliminado en Fase 3**; la Safe es ahora el destino directo. |
 | `docs/integrators/blio.md` | 80 | Documentación operativa del integrador. |
 | `scripts/deploy-blio.ts` | 229 | Deploy + registro en el Diamond (`usdcThroughIntegrator = false`) + verificación de config. |
 | `scripts/set-blio-products.ts` | 95 | Configuración idempotente de productos 1..4. |
@@ -402,7 +404,7 @@ npx hardhat test test/blio-integrator.test.ts
 
 - El test llamado “ignores cancel after completion” (`test/blio-integrator.test.ts:142-148`) **no llama** a `onOrderCancel`; solo comprueba que un segundo `simulateOrderComplete` revierte. No cubre el caso cancel-after-complete.
 - No hay test del comportamiento real por defecto `cancelCallbackEnabled = false` usando `simulateOrderCancelledNoCallback`.
-- No hay test con `recipientAddr` siendo un contrato (vault/Safe); solo EOA (`treasury` signer).
+- No hay test con `recipientAddr` siendo un contrato (Safe); solo EOA (`treasury` signer).
 - No hay test de `configReadable = false` (fallback por balance).
 
 ## 10. Restricciones técnicas
@@ -411,7 +413,7 @@ npx hardhat test test/blio-integrator.test.ts
 | --- | --- |
 | Límite de runtime (EIP-170) | **24.576 bytes** |
 | Runtime de `BlioCheckoutIntegrator` | **7.400 bytes** (mucho margen) |
-| Runtime de `BlioTreasuryVault` | **2.312 bytes** |
+| Runtime del contrato de tesorería intermedio | **eliminado en Fase 3** |
 | Initcode de `BlioCheckoutIntegrator` | **11.413 bytes** (límite EIP-3860: 49.152) |
 | Solidity | Compilador **0.8.28**; pragma del contrato `^0.8.20` |
 | Settings | `evmVersion: "cancun"`, `viaIR: true`, optimizer `enabled`, `runs: 200` |
@@ -431,7 +433,7 @@ El límite de 24.576 bytes es el que ya obliga a `MerchantTerminalIntegrator` a 
 
 1. **La dirección v1 del encargo es incorrecta.** `0x63460ae9552e0b7c3c1b4f4dcd2c4f7f0b1a6e5b` no tiene código. La real es `0x63460ae9566e9274d0034636B85243c216F2FD73`. Cualquier script o verificación que use la primera fallará o leerá vacío.
 
-2. **v1 usa una EOA como tesorería y como owner.** `0xb975…` tiene 0 bytes de código y es a la vez `treasury` y `owner`. La documentación (`docs/integrators/blio.md:61-62`) dice que ambos “deberían ser el multisig de blio”; el despliegue v1 no lo cumple. v2 sí lo corrige: vault + Safe v1.5.0 2-de-3.
+2. **v1 usa una EOA como tesorería y como owner.** `0xb975…` tiene 0 bytes de código y es a la vez `treasury` y `owner`. La documentación (`docs/integrators/blio.md:61-62`) dice que ambos “deberían ser el multisig de blio”; el despliegue v1 no lo cumple. v2 usó un contrato intermedio + Safe v1.5.0 2-de-3; la v3 apunta directo a la Safe, sin contrato intermedio.
 
 3. **`cancelCallbackEnabled = false` en v1 y v2.** En producción, el Diamond **no llama** `onOrderCancel` al cancelar un BUY. Consecuencia: el slot diario que `validateOrder` consumió no se libera en cancelaciones/expirables. El mock de tests sí llama al callback (`simulateOrderCancelled`), por lo que el test pasa pero no refleja el comportamiento real. Si el rediseño depende de `onOrderCancel`, hay que pedir al super-admin:
    ```text
@@ -504,8 +506,8 @@ cast call 0x239dd5df6f460c7df65072b0483e0fbf009f04a3 "dailyTxCountLimit()(uint25
 
 ## 13. Decisiones que debe cerrar la Fase 1
 
-1. **Destino de tesorería:** Safe directa o `BlioTreasuryVault` (vault + Safe). El vault ya está desplegado en v2 y permite split de afiliado y distribución permissionless; la Safe directa es más simple pero exige una transacción Safe para mover fondos.
+1. **Destino de tesorería (cerrado):** **Safe de blio directa** (`0xFB25…`), inmutable del constructor. Sin contrato intermedio ni reparto; mover fondos exige una transacción Safe.
 2. **Cancel callback:** pedir `setIntegratorCancelCallback(<nuevo integrator>, true)` o aceptar el leak de slots y reconciliar por backend.
-3. **Contrato nuevo vs reutilizar v2:** v2 ya tiene vault, Safe y `baseTxLimit=100`, `dailyTxCountLimit=100`. Cambiar `treasury` o `owner` en v2 no es posible (son inmutables en el integrador; el vault sí permite cambiar `recipient`). Si se quiere otra tesorería, hay que desplegar un integrador nuevo.
+3. **Contrato nuevo vs reutilizar v2:** se despliega un integrador nuevo. El v2 usaba un contrato intermedio; en v3 `treasury` y `owner` son inmutables y apuntan a la Safe, así que cambiar de tesorería exige otro despliegue.
 4. **Indexación:** consumir `BlioOrderCompleted` con idempotencia por `orderId` y alerta por `SettlementRoutingAnomaly`; no conceder Premium por `BlioOrderCreated`.
 5. **Comprador:** mantener EOA/proxy como `user` para que `paidBuyOrder`/`cancelOrder` sigan siendo ejecutables; si se usa Safe/smart account, diseñar ese flujo explícitamente.

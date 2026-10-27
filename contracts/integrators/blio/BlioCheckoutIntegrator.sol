@@ -22,10 +22,11 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  *         Diamond pays USDC to `treasury`.
  *
  *         ── Where the money goes (no custody) ─────────────────────────────
- *         `recipientAddr` is pinned to the immutable `treasury` and the
- *         integrator is registered with `usdcThroughIntegrator = false`, so
- *         the Diamond settles USDC DIRECTLY to the treasury. This contract
- *         never holds user funds at any point, which is why it has no
+ *         `recipientAddr` is pinned to the immutable `treasury` (the blio Safe)
+ *         and the integrator is registered with `usdcThroughIntegrator = false`,
+ *         so the Diamond settles USDC DIRECTLY to that Safe. There is no vault
+ *         and no affiliate split: every settlement is a single transfer. This
+ *         contract never holds user funds at any point, which is why it has no
  *         withdrawal path for orders and only a stray-token `sweepUsdc`
  *         recovery hatch. blio's backend watches completion events and grants
  *         Premium off-chain.
@@ -131,7 +132,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     /// @notice Canonical `UserProxy` master every per-user clone deploys from.
     ///         Pinned on the Diamond at registration and set-once there.
     address public immutable proxyImpl;
-    /// @notice Where the Diamond settles the USDC. Never this contract.
+    /// @notice Where the Diamond settles the USDC (the blio Safe). Never this
+    ///         contract, and never an intermediate vault.
     address public immutable treasury;
     /// @notice Signer of the KYC/liveness attestations. Immutable: rotating it
     ///         requires a redeploy, which is the point — no owner key can mint
@@ -200,9 +202,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
 
     struct Session {
         address user; // 20 bytes
-        bool fulfilled; //  1 byte  — packs with user
-        bool cancelled; //  1 byte  — packs with user
-        uint32 placementDay; // 4 bytes — key for the onOrderCancel decrement
+        bool fulfilled; //  1 byte — packs with user
+        bool cancelled; //  1 byte — packs with user
         uint256 productId;
         uint256 quantity;
         uint256 usdcAmount;
@@ -235,7 +236,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     /**
      * @param _diamond      P2P Diamond proxy for the target network.
      * @param _usdc         USDC the Diamond settles in on that network.
-     * @param _treasury     Destination of every settlement (a multisig).
+     * @param _treasury     Destination of every settlement (the blio Safe).
      * @param _owner        Operator key (a multisig): limits, products, pause.
      *                      Transferable two-step via `transferOwnership` /
      *                      `acceptOwnership`.
@@ -447,7 +448,6 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             user: msg.sender,
             fulfilled: false,
             cancelled: false,
-            placementDay: uint32(block.timestamp / 1 days),
             productId: productId,
             quantity: quantity,
             usdcAmount: total
@@ -534,7 +534,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         address recipientAddr
     ) external onlyDiamond {
         Session storage session = sessions[orderId];
-        if (session.user == address(0) || session.fulfilled || session.cancelled) return;
+        // A cancellation is NOT terminal in the protocol: an admin can re-open a
+        // CANCELLED BUY (dispute path) and complete it. Ignoring `cancelled`
+        // here is what lets that reopened order still grant Premium; only an
+        // already-fulfilled session is truly done.
+        if (session.user == address(0) || session.fulfilled) return;
 
         // Ask the Diamond how it is routing us, rather than trusting the
         // callback itself: `recipientAddr` is passed unchanged in both routing
@@ -557,20 +561,19 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         emit BlioOrderCompleted(orderId, session.user, session.productId, session.quantity, amount);
     }
 
-    /// @notice Cancellation hook. Releases the daily-count slot reserved in
-    ///         `validateOrder`, keyed on the placement-day snapshot.
-    /// @dev    Never reverts (best-effort from the gateway's POV).
+    /// @notice Cancellation hook. Marks the session cancelled; it does NOT
+    ///         release the daily-count slot reserved in `validateOrder`.
+    /// @dev    The counter measures PLACEMENTS, not successful settlements, so
+    ///         cancel-and-retry still consumes the user's daily allowance. That
+    ///         is also coherent with `cancelCallbackEnabled = false`: the
+    ///         gateway may never call this hook at all, so any refund of the
+    ///         slot here would be best-effort and gameable. Never reverts
+    ///         (best-effort from the gateway's POV).
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         Session storage session = sessions[orderId];
         if (session.user == address(0) || session.fulfilled || session.cancelled) return;
 
         session.cancelled = true;
-
-        uint256 day = uint256(session.placementDay);
-        uint256 count = userDailyCount[session.user][day];
-        if (count > 0) {
-            userDailyCount[session.user][day] = count - 1;
-        }
 
         emit BlioOrderCancelled(orderId, session.user);
     }
