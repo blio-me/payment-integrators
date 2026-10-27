@@ -52,6 +52,14 @@ constructor. The owner may only tighten them, never raise them:
 
 All non-INR currencies share the `OTHER_CURRENCY` bucket (`bytes32(0)`).
 
+**Currency allowlist.** Only exact, owner-approved labels can be placed
+(`allowedCurrency`, `setCurrencyAllowed(bytes32,bool)` +
+`CurrencyAllowlistUpdated`). The constructor enables the canonical
+`bytes32("INR")` and the `bytes32(0)` wildcard; every other fiat (BRL/PIX/…)
+must be opted in. A non-allowed label reverts `CurrencyNotAllowed` in
+`userPlaceOrder`, so look-alikes such as `keccak("INR")`, `"inr"` or `"INR "`
+can no longer fall into the looser OTHER bucket.
+
 **Daily limit:** `dailyTxCountLimit = 5` **placements per user per UTC day**.
 The counter is incremented in `validateOrder`, i.e. when the order is placed,
 not when it settles.
@@ -77,8 +85,14 @@ signature is submitted.
 - **Submission:** `submitLivenessAttestation(user, tier, nullifier, deadline, signature)`.
   Anyone may submit it (a relayer can pay gas); the signature, not
   `msg.sender`, authorizes the grant.
-- **`deadline`:** freshness bound only. The claim must land at or before it;
-  the tier itself does not expire.
+- **`deadline`:** claim freshness bound. The claim must land at or before it,
+  and it cannot be more than `MAX_ATTESTATION_DEADLINE` (15 minutes) in the
+  future — a far-future or `type(uint256).max` deadline reverts
+  `DeadlineTooFar`.
+- **Tier TTL:** a recorded tier stays usable for `ATTESTATION_TTL` (180 days)
+  after `attestedAt`; `attestationExpiresAt` exposes the cutoff. Past it,
+  `_tierOf` reports `None` (zero limit, `NotAttested` on placement) and the
+  buyer must be re-attested.
 - **Nullifier:** a per-human Sybil nullifier from the KYC service. It is
   single-use (`usedNullifier`), so the same grant can never be replayed, even
   for another wallet or tier. Reuse reverts with `NullifierUsed`.

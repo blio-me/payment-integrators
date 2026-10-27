@@ -66,7 +66,7 @@ describe("BlioCheckoutIntegrator", function () {
     const nullifier =
       opts.nullifier ??
       ethers.keccak256(ethers.toUtf8Bytes(`null:${opts.user}:${Date.now()}:${Math.random()}`));
-    const deadline = opts.deadline ?? (await now()) + 3600n;
+    const deadline = opts.deadline ?? (await now()) + 600n;
     const value = {
       user: opts.user,
       tier: opts.tier ?? TIER_LIVENESS,
@@ -118,6 +118,9 @@ describe("BlioCheckoutIntegrator", function () {
     );
     await integrator.setProductPrice(PRODUCT_ID, PRODUCT_PRICE);
     await integrator.setProductActive(PRODUCT_ID, true);
+    // BRL is a real blio currency but the constructor only seeds INR and the
+    // OTHER wildcard, so the owner opts it in explicitly.
+    await integrator.setCurrencyAllowed(BRL, true);
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(10000));
 
     // `user` starts attested at the liveness tier so the pre-existing checkout
@@ -265,6 +268,78 @@ describe("BlioCheckoutIntegrator", function () {
           attestor.address
         )
       ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
+    });
+  });
+
+  describe("Currency allowlist", function () {
+    const ZERO = ethers.ZeroHash;
+
+    it("allows INR and bytes32(0) in the constructor", async function () {
+      expect(await integrator.allowedCurrency(INR)).to.equal(true);
+      expect(await integrator.allowedCurrency(ZERO)).to.equal(true);
+      expect(await integrator.allowedCurrency(ethers.encodeBytes32String("PIX"))).to.equal(false);
+    });
+
+    it("keeps the canonical INR bucket at 20/100", async function () {
+      expect(await integrator.userTxLimitFor(user.address, INR)).to.equal(USDC(20));
+      await attest(user2, TIER_PASSPORT);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
+    });
+
+    it("keeps bytes32(0) in the OTHER bucket at 50/200", async function () {
+      expect(await integrator.limitFor(ZERO, TIER_LIVENESS)).to.equal(USDC(50));
+      expect(await integrator.limitFor(ZERO, TIER_PASSPORT)).to.equal(USDC(200));
+
+      await expect(place(user, 5, ZERO)).to.not.be.reverted;
+      await expect(place(user, 6, ZERO)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+
+      await attest(user2, TIER_PASSPORT);
+      await expect(place(user2, 20, ZERO)).to.not.be.reverted;
+      await expect(place(user2, 21, ZERO)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+    });
+
+    it("rejects look-alike INR labels that would land in OTHER", async function () {
+      const aliases = [
+        ethers.keccak256(ethers.toUtf8Bytes("INR")),
+        ethers.encodeBytes32String("inr"),
+        ethers.encodeBytes32String("INR "),
+      ];
+      for (const currency of aliases) {
+        await expect(place(user, 1, currency)).to.be.revertedWithCustomError(
+          integrator,
+          "CurrencyNotAllowed"
+        );
+        expect(await integrator.userTxLimitFor(user.address, currency)).to.equal(0n);
+      }
+    });
+
+    it("lets the owner add and remove currencies, but not a user", async function () {
+      const PIX = ethers.encodeBytes32String("PIX");
+
+      await expect(
+        integrator.connect(user).setCurrencyAllowed(PIX, true)
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+
+      await expect(integrator.setCurrencyAllowed(PIX, true))
+        .to.emit(integrator, "CurrencyAllowlistUpdated")
+        .withArgs(PIX, true);
+      expect(await integrator.allowedCurrency(PIX)).to.equal(true);
+      await expect(place(user, 1, PIX)).to.not.be.reverted;
+
+      await expect(integrator.setCurrencyAllowed(PIX, false))
+        .to.emit(integrator, "CurrencyAllowlistUpdated")
+        .withArgs(PIX, false);
+      expect(await integrator.allowedCurrency(PIX)).to.equal(false);
+      await expect(place(user, 1, PIX)).to.be.revertedWithCustomError(
+        integrator,
+        "CurrencyNotAllowed"
+      );
     });
   });
 
@@ -507,6 +582,52 @@ describe("BlioCheckoutIntegrator", function () {
         integrator,
         "AttestationExpired"
       );
+    });
+
+    it("reverts DeadlineTooFar past the 15-minute cap", async function () {
+      const t = await now();
+      // Pin the next block to t+1 so `deadline = t+902` is exactly one second
+      // beyond `block.timestamp + MAX_ATTESTATION_DEADLINE`.
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t) + 1]);
+      const a = await signAttestation({ user: user2.address, deadline: t + 902n });
+      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "DeadlineTooFar");
+      expect(await integrator.tierOf(user2.address)).to.equal(0n);
+    });
+
+    it("accepts a deadline within the cap", async function () {
+      const a = await signAttestation({
+        user: user2.address,
+        deadline: (await now()) + 600n,
+      });
+      await expect(submit(user2, a)).to.not.be.reverted;
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+    });
+
+    it("expires the recorded tier after ATTESTATION_TTL", async function () {
+      const a = await attest(user2, TIER_LIVENESS);
+      const expiresAt = await integrator.attestationExpiresAt(user2.address);
+      const attestedAt = await integrator.attestedAt(user2.address);
+      expect(expiresAt).to.equal(attestedAt + (await integrator.ATTESTATION_TTL()));
+
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
+
+      await ethers.provider.send("evm_increaseTime", [
+        Number(await integrator.ATTESTATION_TTL()) + 1,
+      ]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Raw tier is still stored, but the gate treats it as None.
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(0n);
+      await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
+
+      // A fresh attestation revives it and resets the TTL.
+      const fresh = await signAttestation({ user: user2.address, nullifier: a.nullifier });
+      await expect(submit(user2, fresh)).to.be.revertedWithCustomError(integrator, "NullifierUsed");
+      const reattest = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
+      await expect(submit(user2, reattest)).to.not.be.reverted;
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
     });
 
     it("reverts InvalidTier for a tier outside Liveness/Passport", async function () {

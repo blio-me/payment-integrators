@@ -65,6 +65,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     /// @notice An owner-settable limit was set above its immutable ceiling.
     error CapExceedsCeiling();
     error InvalidTier();
+    /// @notice The currency is not on the owner-managed allowlist. Only the
+    ///         canonical label is allowed per fiat (no `keccak("INR")`,
+    ///         lowercase or padded aliases falling into the OTHER bucket).
+    error CurrencyNotAllowed();
 
     // KYC / attestation
     /// @notice The buyer has no attestation; the checkout is closed to them.
@@ -77,12 +81,15 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     error InvalidSignature();
     /// @notice An attestation can only raise the tier, never lower it.
     error TierDowngrade();
+    /// @notice The signed claim deadline is further out than allowed.
+    error DeadlineTooFar();
 
     // ─── Events ───────────────────────────────────────────────────────
 
     event ProductPriceSet(uint256 indexed productId, uint256 price);
     event ProductActiveSet(uint256 indexed productId, bool active);
     event TxLimitUpdated(bytes32 indexed currency, Tier indexed tier, uint256 limit);
+    event CurrencyAllowlistUpdated(bytes32 indexed currency, bool allowed);
     event DailyTxCountLimitUpdated(uint256 count);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
@@ -147,6 +154,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     // directions.
     uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5; // placements/user/day
 
+    /// @notice A signed attestation claim must land within this window of
+    ///         `block.timestamp`; a far-future deadline cannot be redeemed.
+    uint256 public constant MAX_ATTESTATION_DEADLINE = 15 minutes;
+    /// @notice How long a recorded tier stays usable after `attestedAt`.
+    ///         Past this point `_tierOf` reports `None` (fail closed).
+    uint256 public constant ATTESTATION_TTL = 180 days;
+
     /// @notice Per-tx ceilings by currency class and verification tier
     ///         (6 decimals). INR is deliberately tighter than the rest.
     uint256 public constant MAX_TX_LIMIT_INR_LIVENESS = 20e6; // $20
@@ -176,6 +190,12 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ///      (6 decimals). Initialized to the immutable ceilings in the
     ///      constructor; every owner write is bounded by them.
     mapping(bytes32 => mapping(Tier => uint256)) private _limitFor;
+    /// @notice Owner-managed allowlist of exact currency labels. INR and the
+    ///         OTHER wildcard (`bytes32(0)`) are enabled in the constructor;
+    ///         any other label (BRL, PIX, ...) must be explicitly added. This
+    ///         blocks look-alike labels (`keccak("INR")`, `"inr"`, `"INR "`)
+    ///         from reaching the looser OTHER bucket.
+    mapping(bytes32 => bool) public allowedCurrency;
     /// @notice Placements allowed per user per UTC day.
     uint256 public dailyTxCountLimit;
     bool public paused;
@@ -185,6 +205,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     mapping(address => Tier) public tierOf;
     /// @notice Timestamp of the last accepted attestation for each buyer.
     mapping(address => uint256) public attestedAt;
+    /// @notice Timestamp after which the recorded tier stops counting.
+    mapping(address => uint256) public attestationExpiresAt;
     /// @notice Per-(tenant, human) Sybil nullifiers already consumed. Once a
     ///         nullifier is used it can never be replayed, even for another
     ///         tier or another wallet.
@@ -276,6 +298,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         _limitFor[OTHER_CURRENCY][Tier.Liveness] = MAX_TX_LIMIT_OTHER_LIVENESS;
         _limitFor[OTHER_CURRENCY][Tier.Passport] = MAX_TX_LIMIT_OTHER_PASSPORT;
 
+        // The canonical INR label and the OTHER wildcard are the only ones
+        // enabled out of the box; every other fiat is opt-in via the owner.
+        allowedCurrency[INR_CURRENCY] = true;
+        allowedCurrency[OTHER_CURRENCY] = true;
+
         proxyImpl = address(new UserProxy());
     }
 
@@ -305,6 +332,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         if (count > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
         dailyTxCountLimit = count;
         emit DailyTxCountLimitUpdated(count);
+    }
+
+    /// @notice Enable or disable an exact currency label. Only enabled labels
+    ///         (plus `bytes32(0)`, the OTHER wildcard) can be placed.
+    function setCurrencyAllowed(bytes32 currency, bool allowed) external onlyOwner {
+        allowedCurrency[currency] = allowed;
+        emit CurrencyAllowlistUpdated(currency, allowed);
     }
 
     function pause() external onlyOwner {
@@ -347,8 +381,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      *
      *         `deadline` is a claim-freshness bound only, mirroring the
      *         investabl-challenge pattern: it stops a stale signature from
-     *         being redeemed much later, but the tier itself does not expire.
-     *         The nullifier is single-use, so a grant can never be re-claimed.
+     *         being redeemed much later. It is additionally capped to
+     *         `block.timestamp + MAX_ATTESTATION_DEADLINE` (15 minutes), so a
+     *         signature with `type(uint256).max` cannot sit around forever.
+     *         The recorded tier then stays usable for `ATTESTATION_TTL`
+     *         (180 days); after that `_tierOf` reports `None` and the buyer
+     *         must be re-attested. The nullifier is single-use, so a grant can
+     *         never be re-claimed.
      *
      *         Tiers are monotonic: an attestation can only raise the buyer's
      *         level. An attempt to go back down (Passport -> Liveness) reverts
@@ -370,6 +409,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ) external {
         if (user == address(0)) revert InvalidAddress();
         if (block.timestamp > deadline) revert AttestationExpired();
+        if (deadline > block.timestamp + MAX_ATTESTATION_DEADLINE) revert DeadlineTooFar();
         if (tier != uint8(Tier.Liveness) && tier != uint8(Tier.Passport)) revert InvalidTier();
         if (usedNullifier[nullifier]) revert NullifierUsed();
 
@@ -381,6 +421,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         usedNullifier[nullifier] = true;
         tierOf[user] = Tier(tier);
         attestedAt[user] = block.timestamp;
+        attestationExpiresAt[user] = block.timestamp + ATTESTATION_TTL;
 
         emit AttestationSubmitted(user, tier, nullifier);
     }
@@ -406,7 +447,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ) external nonReentrant returns (uint256 orderId) {
         if (paused) revert ContractPaused();
         if (quantity == 0) revert InvalidQuantity();
-        if (tierOf[msg.sender] == Tier.None) revert NotAttested();
+        if (!allowedCurrency[currency]) revert CurrencyNotAllowed();
+        if (_tierOf(msg.sender) == Tier.None) revert NotAttested();
 
         uint256 price = productPrice[productId];
         if (price == 0) revert ProductNotFound();
@@ -504,7 +546,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         // Authoritative attestation gate: an unattested buyer can never place an
         // order, and unlike the amount/daily checks this reverts (rather than
         // returning false) so the reason is visible in the receipt.
-        if (tierOf[user] == Tier.None) revert NotAttested();
+        if (_tierOf(user) == Tier.None) revert NotAttested();
+        if (!allowedCurrency[currency]) revert CurrencyNotAllowed();
 
         if (amount == 0) return false;
         if (amount > userTxLimitFor(user, currency)) return false;
@@ -581,10 +624,12 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     // ─── Views ────────────────────────────────────────────────────────
 
     /// @notice Effective per-tx USDC limit for `user` in `currency`, based on
-    ///         the buyer's verification tier.
+    ///         the buyer's verification tier. Returns 0 (fail closed) when
+    ///         the tier is missing/expired or the label is not allowlisted.
     function userTxLimitFor(address user, bytes32 currency) public view returns (uint256) {
         Tier tier = _tierOf(user);
         if (tier == Tier.None) return 0;
+        if (!allowedCurrency[currency]) return 0;
         return _limitFor[normalizeCurrency(currency)][tier];
     }
 
@@ -613,7 +658,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     }
 
     /// @notice Currency class the limit matrix is keyed by: INR is its own
-    ///         bucket and every other currency shares `OTHER_CURRENCY`.
+    ///         bucket and every other currency shares `OTHER_CURRENCY`. Only
+    ///         the exact canonical labels reach a bucket: INR must be
+    ///         `bytes32("INR")`, and the OTHER bucket is reachable only via
+    ///         `bytes32(0)` or an owner-allowlisted label. Look-alikes such as
+    ///         `keccak("INR")`, `"inr"` or `"INR "` are rejected on placement.
     function normalizeCurrency(bytes32 currency) public pure returns (bytes32) {
         return currency == INR_CURRENCY ? INR_CURRENCY : OTHER_CURRENCY;
     }
@@ -631,9 +680,12 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     }
 
     /// @dev The recorded tier, or `None` — which `userTxLimitFor` maps to a zero
-    ///      limit, so an unattested buyer cannot transact.
+    ///      limit, so an unattested or expired buyer cannot transact.
     function _tierOf(address user) internal view returns (Tier) {
-        return tierOf[user];
+        Tier tier = tierOf[user];
+        if (tier == Tier.None) return Tier.None;
+        if (block.timestamp > attestationExpiresAt[user]) return Tier.None;
+        return tier;
     }
 
     function getRemainingDailyCount(address user) external view returns (uint256) {

@@ -47,7 +47,7 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
     const nullifier = ethers.keccak256(
       ethers.toUtf8Bytes(`poc:${who.address}:${Date.now()}:${Math.random()}`)
     );
-    const deadline = (await now()) + 3600n;
+    const deadline = (await now()) + 600n;
     const value = { user: who.address, tier, nullifier, deadline };
     const domain = {
       name: "BlioCheckoutIntegrator",
@@ -91,6 +91,7 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
     );
     await integrator.setProductPrice(PRODUCT_ID, PRODUCT_PRICE);
     await integrator.setProductActive(PRODUCT_ID, true);
+    await integrator.setCurrencyAllowed(BRL, true);
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(10000));
     await attest(user);
   });
