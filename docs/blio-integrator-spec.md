@@ -1,0 +1,511 @@
+# Especificación verificada — integrador blio/p2p (Fase 0)
+
+> **Estado:** solo lectura. No se modificó código de contratos, no se desplegó nada y no se tocó `blio/apps/api`.
+>
+> **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD:** `21217e8`
+>
+> **Fecha de verificación:** 2026-10-27 · **Red:** Base Sepolia (`chainId 84532`) · **RPC:** `https://sepolia.base.org`
+
+## 0. Método y límite de la verificación
+
+El código del Diamond real **no está vendorizado** en este repo. Lo que sí está:
+
+- Las interfaces públicas (`contracts/interfaces/IB2BGateway.sol`, `IP2PIntegrator.sol`, `IOrderFlow.sol`).
+- `contracts/test/MockDiamond.sol`, que declara explícitamente que replica el comportamiento del `B2BGatewayFacet` real (incluido el orden del struct de `getIntegratorConfig`).
+- Documentación de conformidad (`docs/ARCHITECTURE.md`, `docs/WHITELISTING.md`, `docs/INTEGRATORS.md`).
+- Lecturas y logs reales contra Base Sepolia.
+
+Por tanto, la especificación combina **código del repo + comportamiento observado on-chain**. Donde la fuente real no está en el repo, se indica y se cita la evidencia on-chain.
+
+## 1. Direcciones verificadas
+
+| Elemento | v1 | v2 |
+| --- | --- | --- |
+| Integrador | `0x63460ae9566e9274d0034636B85243c216F2FD73` | `0x239dd5df6f460c7df65072b0483e0fbf009f04a3` |
+| Runtime | 7.400 bytes | 7.400 bytes |
+| Bloque de deploy | 47.866.045 | 48.188.524 |
+| `getIntegratorConfig` | `[true, false, false, 8, proxyImpl]` | `[true, false, false, 4, proxyImpl]` |
+| `usdcThroughIntegrator` | `false` | `false` |
+| `cancelCallbackEnabled` | `false` | `false` |
+| `baseTxLimit` | `100000000` (100 USDC, 6 dec) | `100000000` (100 USDC, 6 dec) |
+| `dailyTxCountLimit` | `10` | `100` |
+| `proxyImpl` | `0x71146B465CE3eEE05108D5f69d82BE92F85F8F64` | `0xC219b46bE7D8395Edbef12Fd78C20385da8a0783` |
+| `treasury()` | `0xb975Bc0b57B7E4adBE81E2412446390e66A66D33` | `0xd3704B0f3B869c238b2622C015Ec2f5Bb103e89A` |
+| Tipo de `treasury` | **EOA** (`eth_getCode = 0x`, 0 bytes) | **Contrato** `BlioTreasuryVault` (2.312 bytes) |
+| `owner()` | `0xb975Bc0b57B7E4adBE81E2412446390e66A66D33` (misma EOA) | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` (**Safe v1.5.0, 2-de-3**) |
+| `paused()` | `false` | `false` |
+| USDC | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (`GG`, 6 dec) | mismo |
+
+**Corrección importante:** la dirección v1 del encargo, `0x63460ae9552e0b7c3c1b4f4dcd2c4f7f0b1a6e5b`, **no tiene código** (0 bytes). La dirección real y verificada es `0x63460ae9566e9274d0034636B85243c216F2FD73`.
+
+Diamond Base Sepolia: `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9`.
+Diamond Base mainnet (documentado): `0x4cad6eC90e65baBec9335cAd728DDC610c316368`.
+
+El token de pruebas de Base Sepolia tiene símbolo `GG` y 6 decimales; no es el USDC canónico de mainnet.
+
+## 2. Diamond — `getIntegratorConfig`
+
+**Selector:** `0x17353447` = `getIntegratorConfig(address)`.
+
+El integrador de blio lee el flag de routing crudo por selector y offset:
+
+- `contracts/integrators/blio/BlioCheckoutIntegrator.sol:495-512`
+
+### 2.1 Layout post-#362 (5 palabras, el actual)
+
+| Índice | Tipo | Campo | Significado |
+| --- | --- | --- | --- |
+| 0 | `bool` | `isActive` | Integrador registrado/activo. Si es `false`, los nuevos `placeB2BOrder` deben fallar. |
+| 1 | `bool` | `usdcThroughIntegrator` | `true`: el Diamond envía el USDC al integrador al completar. `false`: lo envía directo a `order.recipientAddr`. |
+| 2 | `bool` | `cancelCallbackEnabled` | `true`: el Diamond llama `onOrderCancel` al cancelar un BUY. **Por defecto `false`**. |
+| 3 | `uint256` | `activeOrderCount` | Número de órdenes activas del integrador (contador del gateway, no un límite). |
+| 4 | `address` | `proxyImpl` | Implementación canónica de `UserProxy` fijada en el registro; se usa para derivar CREATE2. |
+
+Fuentes: `scripts/lib/diamond.ts:27-42`, `contracts/test/MockDiamond.sol:143-159`, decode por forma en `scripts/lib/diamond.ts:49-88`.
+
+### 2.2 Layout pre-#362 (4 palabras)
+
+| Índice | Tipo | Campo |
+| --- | --- | --- |
+| 0 | `bool` | `isActive` |
+| 1 | `bool` | `usdcThroughIntegrator` |
+| 2 | `uint256` | `activeOrderCount` |
+| 3 | `address` | `proxyImpl` |
+
+**No se debe decodificar con un ABI tipado fijo.** Un ABI de 4 campos contra un Diamond de 5 campos no revierte: lee `proxyImpl` del slot de `activeOrderCount` y devuelve `address(0)` o una dirección fabricada. Por eso `scripts/lib/diamond.ts` decodifica por número de palabras (`5` o `4`). Si el struct vuelve a crecer, hay que añadir el layout, no adivinar.
+
+El flag de routing (`usdcThroughIntegrator`) está en el **word 1** en ambos layouts, que es exactamente lo que lee `BlioCheckoutIntegrator._routesThroughIntegrator()`.
+
+## 3. Diamond — `placeB2BOrder`
+
+Firma en `contracts/interfaces/IB2BGateway.sol:9-18`:
+
+```solidity
+function placeB2BOrder(
+    address user,
+    uint256 amount,
+    bytes32 currency,
+    address recipientAddr,
+    string calldata pubKey,
+    uint256 circleId,
+    uint256 preferredPaymentChannelConfigId,
+    uint256 fiatAmountLimit
+) external returns (uint256 orderId);
+```
+
+| Parámetro | Semántica verificada |
+| --- | --- |
+| `user` | Dirección del comprador; queda como `order.user` y es la única autorizada para `paidBuyOrder` / `cancelOrder` (ver `contracts/interfaces/IOrderFlow.sol:36-57`). En blio se pasa `msg.sender` del `userPlaceOrder`. |
+| `amount` | Importe en USDC, 6 decimales. |
+| `currency` | `bytes32` de la moneda fiat (p. ej. `INR`, `BRL`). |
+| `recipientAddr` | Destino del USDC cuando `usdcThroughIntegrator = false`. **Es una dirección arbitraria: no se exige que tenga código ni hay whitelist.** |
+| `pubKey` | Cadena opaca de la pubkey P2P del usuario para la comunicación con el merchant. El integrador la reenvía sin validarla. |
+| `circleId` | Círculo P2P. El Diamond real rechaza `circleId = 0` (el mock lo replica para SELL en `MockDiamond.sol:247-249`). |
+| `preferredPaymentChannelConfigId` | Configuración de canal preferida; se reenvía tal cual. |
+| `fiatAmountLimit` | Límite del tramo fiat; se reenvía tal cual. |
+
+Blio coloca la orden así:
+
+```solidity
+// BlioCheckoutIntegrator.sol:340-364
+address proxy = _ensureProxy(msg.sender);
+bytes memory data = abi.encodeCall(
+    IB2BGateway.placeB2BOrder,
+    (msg.sender, total, currency, treasury, pubKey, circleId,
+     preferredPaymentChannelConfigId, fiatAmountLimit)
+);
+bytes memory result = UserProxy(proxy).execute(diamond, data, address(usdc), 0);
+return abi.decode(result, (uint256));
+```
+
+### 3.1 Quién puede llamar
+
+No llama el integrador directamente: llama **el `UserProxy` del usuario**, que es `msg.sender` para el Diamond.
+
+El gateway autoriza al proxy mediante CREATE2:
+
+- `MockDiamond.sol:271-304` replica `_resolveIntegrator`:
+  - `msg.sender` debe tener código.
+  - `msg.sender.integrator()` debe ser un integrador activo.
+  - `msg.sender.owner()` debe ser distinto de cero.
+  - La dirección se re-deriva con `Clones.predictDeterministicAddressWithImmutableArgs(proxyImpl, abi.encodePacked(owner, integrator), bytes32(uint256(uint160(owner))), integrator)` y debe coincidir exactamente con `msg.sender`.
+- `docs/ARCHITECTURE.md:25-27` describe el mismo flujo.
+- `docs/WHITELISTING.md:58` aclara que el `proxyImpl` no se re-verifica en registro; el gate real es la revisión off-chain del bytecode.
+
+### 3.2 Creación del `UserProxy`
+
+Blio:
+
+- `proxyImpl = address(new UserProxy())` en el constructor: `BlioCheckoutIntegrator.sol:202-208`.
+- Salt: `bytes32(uint256(uint160(user)))`: `:514-516`.
+- Immutable args: `abi.encodePacked(user, address(this))`: `:518-520`.
+- Predicción: `Clones.predictDeterministicAddressWithImmutableArgs(proxyImpl, args, salt, address(this))`: `:482-491`.
+- Deploy si no existe: `Clones.cloneDeterministicWithImmutableArgs(...)`: `:522-533`.
+
+`UserProxy` lee sus args del runtime:
+
+- Layout `[owner(20)][integrator(20)]`: `contracts/base/UserProxy.sol:37-44`, `:84-99`.
+- `execute` solo puede llamarlo el integrador y prohíbe `target == proxy` o `target == integrator`: `UserProxy.sol:114-144`.
+
+## 4. Diamond — `validateOrder`
+
+Firma en `contracts/interfaces/IP2PIntegrator.sol:10-14`:
+
+```solidity
+function validateOrder(address user, uint256 amount, bytes32 currency)
+    external returns (bool allowed);
+```
+
+Semántica:
+
+- El Diamond la llama **sincrónicamente dentro de `placeB2BOrder`**.
+- Si devuelve `false`, el gateway deshace la colocación; si revierte, también la bloquea.
+- Referencias: `docs/ARCHITECTURE.md:52`, `MockDiamond.sol:207-217`.
+
+Implementación de blio (`BlioCheckoutIntegrator.sol:370-396`):
+
+1. Solo el Diamond (`onlyDiamond`).
+2. Rechaza si `paused`, si no hay `_pendingPlacement`, si ya fue validada, o si `(user, amount, currency)` no coincide exactamente con la colocación en curso.
+3. Rechaza `amount == 0`.
+4. Rechaza si supera `userTxLimitFor(user, currency)`.
+5. Rechaza si el contador diario UTC del usuario ya alcanzó `dailyTxCountLimit`.
+6. Marca `pending.validated = true` y **consume** un slot del día.
+
+El campo `validated` es el latch que garantiza:
+
+- Solo una validación exitosa por colocación.
+- Que `userPlaceOrder` pueda comprobar que el Diamond **realmente** llamó a `validateOrder`; si no, revierte con `OrderValidationMissing` (`BlioCheckoutIntegrator.sol:320-323`).
+- Que una segunda llamada del mismo tuple devuelva `false` en vez de consumir dos slots.
+
+## 5. Callbacks
+
+### 5.1 `onOrderComplete`
+
+Firma en `contracts/interfaces/IP2PIntegrator.sol:16-21`:
+
+```solidity
+function onOrderComplete(
+    uint256 orderId,
+    address user,
+    uint256 amount,
+    address recipientAddr
+) external;
+```
+
+- Se invoca cuando la pata fiat se liquida / la orden se completa.
+- El Diamond lo envuelve en `try/catch`: **revertir no revierte la liquidación del protocolo**. El estado on-chain ya quedó finalizado.
+- Evidencia: `MockDiamond.sol:306-351` (comentario y `try/catch`), `docs/ARCHITECTURE.md:29`, `docs/INTEGRATORS.md`.
+- `recipientAddr` se pasa **igual en las dos ramas de routing**; no sirve para detectar si el USDC fue al integrador o al recipient: `MockDiamond.sol:327-343`.
+
+Blio (`BlioCheckoutIntegrator.sol:406-434`):
+
+- Solo el Diamond.
+- Ignora si no hay sesión, si ya está fulfilled o cancelled.
+- Lee `getIntegratorConfig` y usa el **word 1**; si no puede leer el config, cae a `usdc.balanceOf(address(this)) >= amount`.
+- Si `user`, `amount` o `recipientAddr` no coinciden, o si detecta que el USDC se routed al integrador, emite `SettlementRoutingAnomaly` y **no** marca la sesión como fulfilled.
+- Si todo coincide, marca `fulfilled = true` y emite `BlioOrderCompleted`.
+- **Nunca revierte** por diseño (comentario `:398-405`).
+
+### 5.2 `onOrderCancel`
+
+Firma en `contracts/interfaces/IP2PIntegrator.sol:32`:
+
+```solidity
+function onOrderCancel(uint256 orderId) external;
+```
+
+- Se invoca al cancelar un BUY (manual, expiración, disputa o fallo de PAY).
+- El gateway lo envuelve en `try/catch`: **revertir es seguro para el protocolo**, pero se pierde la liberación de contabilidad del integrador.
+- Evidencia: `MockDiamond.sol:424-441`, `IP2PIntegrator.sol:23-31`.
+- **No se invoca por defecto.** El callback es opt-in y por integrador:
+  - `MockDiamond.sol:769-782` lo dice explícitamente: el comportamiento real por defecto es cancelar sin llamar al integrador; `setIntegratorCancelCallback` es opt-in y arranca en `false`.
+  - `docs/WHITELIST-REQUEST-baseSepolia.md:24-39` muestra el flujo real: `setIntegratorCancelCallback(integrator, true)` lo ejecuta el super-admin.
+  - Selector: `0x42de055b` = `setIntegratorCancelCallback(address,bool)`.
+
+Blio (`BlioCheckoutIntegrator.sol:436-452`):
+
+- Solo el Diamond.
+- Ignora sesiones inexistentes, fulfilled o ya cancelled.
+- Marca `cancelled = true`.
+- Devuelve el slot del día usando el `placementDay` guardado al colocar (no el día actual).
+- Emite `BlioOrderCancelled`.
+
+### 5.3 ¿Revertir rompe algo?
+
+| Callback | ¿Revertir rompe el protocolo? | ¿Qué se pierde? |
+| --- | --- | --- |
+| `onOrderComplete` | **No.** El Diamond lo captura con `try/catch`; la liquidación y el estado de la orden ya finalizaron. | El evento `BlioOrderCompleted` y el `fulfilled = true`. blio no concede Premium y la sesión queda abierta. |
+| `onOrderCancel` | **No.** También va en `try/catch`. | La liberación del slot diario / contabilidad del integrador. |
+
+Por eso blio implementa ambos sin revertir y con guards de idempotencia. Aun así, un fallo del callback no se reintenta: el integrador debe ser lo más simple posible y el backend debe alertar por anomalías.
+
+## 6. `recipientAddr`: ¿Safe o EOA?
+
+### Veredicto
+
+**Sí, puede ser una Safe o una EOA.** No hay ninguna comprobación de código, tipo o whitelist sobre `recipientAddr`.
+
+- La firma lo declara como `address` arbitraria: `contracts/interfaces/IB2BGateway.sol:9-18`.
+- Blio solo rechaza `address(0)` en el constructor; no exige código: `BlioCheckoutIntegrator.sol:192-197`.
+- Blio lo fija a `treasury` al colocar: `BlioCheckoutIntegrator.sol:355`.
+- El Diamond, con `usdcThroughIntegrator = false`, hace `usdc.safeTransfer(order.recipientAddr, order.amount)`: `MockDiamond.sol:327-331`; `docs/WHITELISTING.md:44`.
+- USDC es un ERC-20 normal: una transferencia a una EOA o a un contrato funciona igual; no hay hook de recepción tipo ERC-721/1155.
+- El callback recibe `recipientAddr` en ambas ramas, así que el argumento no demuestra el routing: `MockDiamond.sol:333-343`.
+
+### Prueba on-chain
+
+- **v1 (EOA):** `treasury = 0xb975Bc0b57B7E4adBE81E2412446390e66A66D33`, `eth_getCode` = `0x` (0 bytes). Hay órdenes completadas y transferencias directas del Diamond a esa EOA. Ejemplos:
+  - `BlioOrderCompleted` + `Transfer` del Diamond → `0xb975…` en `0x590fb6076593ef09d67b15187ba619114305456f1f53ec6a591c841a5a1c0343`.
+  - `getOrdersById(803)`: `user = 0xb975…`, `recipientAddr = 0xb975…`, `status = 3` (COMPLETED).
+- **v2 (contrato):** `treasury = 0xd3704B0f3B869c238b2622C015Ec2f5Bb103e89A`, `BlioTreasuryVault` con 2.312 bytes de runtime. Hay transferencias directas del Diamond al vault. Ejemplo:
+  - `BlioOrderCompleted` + `Transfer` del Diamond → `0xd370…` en `0x1fac1b097bfd1b6432b505710b6d8e3051ecc890cd5592b74f0733b56916ee13`.
+  - `getOrdersById(915)`: `recipientAddr = 0xd370…`, `status = 3` (COMPLETED).
+
+### Implicaciones
+
+- **Safe directa:** el USDC llega a la Safe; no hace falta que implemente `receive()` para ERC-20. Para moverlo hay que proponer/ejecutar una transacción Safe.
+- **Vault (`BlioTreasuryVault`):** el USDC llega al vault; `distribute()` es permissionless y envía todo el balance a `recipient` y al `affiliate` configurado. `recipient` y `owner` son la Safe v1.5.0 2-de-3 `0xFB25…`. El integrador nunca custodia fondos.
+- **Riesgo si se registra `usdcThroughIntegrator = true`:** el USDC iría al integrador, no al `recipientAddr`. Blio lo detectaría con `SettlementRoutingAnomaly`, pero el dinero quedaría atrapado hasta un `sweepUsdc` del owner. El registro correcto es **`false`**, y así están v1 y v2.
+
+## 7. Eventos necesarios para conceder Premium
+
+### 7.1 `BlioOrderCompleted` — **el evento de concesión**
+
+```solidity
+event BlioOrderCompleted(
+    uint256 indexed orderId,
+    address indexed user,
+    uint256 productId,
+    uint256 quantity,
+    uint256 usdcAmount
+);
+```
+
+- Fuente: `contracts/integrators/blio/BlioCheckoutIntegrator.sol:80-87`.
+- Emisión: `:432-433`.
+- Topic0: `0x84f8b1eb8963da43bf311aada56d7da7ee6ae9c4cba47ee09e6b3cef7ac55b53`.
+- Topics: `orderId`, `user`. Data: `productId`, `quantity`, `usdcAmount` (todos `uint256`).
+- **Es la señal que debe consumir el backend de blio para conceder Premium.** Debe ser idempotente por `orderId` (y idealmente por `txHash + logIndex`).
+- No se emite si hay `SettlementRoutingAnomaly` ni si el callback revierte.
+
+### 7.2 `BlioOrderCreated` — intención / auditoría
+
+```solidity
+event BlioOrderCreated(
+    uint256 indexed orderId,
+    address indexed user,
+    uint256 productId,
+    uint256 quantity,
+    uint256 usdcAmount
+);
+```
+
+- Fuente: `:70-78`; emisión `:337`.
+- Topic0: `0xfcddda00840a4d79eb5443493831cf41186b28fd59f5ea5a0a1d0a9216dd2497`.
+- Útil para conciliación y para el widget (leer `productId`/`quantity` de un solo recibo), **no** para conceder Premium.
+
+### 7.3 `BlioOrderCancelled` — liberar estado
+
+```solidity
+event BlioOrderCancelled(uint256 indexed orderId, address indexed user);
+```
+
+- Fuente: `:89`; emisión `:451`.
+- Topic0: `0x3bcf9740e40f2801ad9f92db36504cacd6508097a685cde5c92d4e93e136f934`.
+- Solo se emite si el Diamond invoca `onOrderCancel`, lo que hoy **no ocurre** porque `cancelCallbackEnabled = false` en v1 y v2.
+
+### 7.4 `SettlementRoutingAnomaly` — alerta, no concesión
+
+```solidity
+event SettlementRoutingAnomaly(
+    uint256 indexed orderId,
+    address expectedUser,
+    address callbackUser,
+    uint256 callbackAmount,
+    address callbackRecipient
+);
+```
+
+- Fuente: `:91-100`; emisión `:428`.
+- Topic0: `0x3efd4238a234314699fca0cb8e34665c9210fcaed89674248f96fd35a988e6ce`.
+- Solo `orderId` es indexed. Data: `expectedUser`, `callbackUser`, `callbackAmount`, `callbackRecipient`.
+- Debe disparar una alerta operativa. La sesión **no** se marca fulfilled; no hay reintento automático.
+
+### 7.5 Eventos del Diamond / proxy (opcionales)
+
+- `B2BOrderPlaced(uint256 indexed orderId, address indexed integrator, address indexed user, uint256 amount)`:
+  - Topic0: `0xc5799d7388fadae738b4512b3d224bd808e5ba046f11b2b55cef5ad7b01c5a1d`.
+  - Fuente: `docs/INTEGRATORS.md:37-46`.
+  - Fallback para obtener el `orderId` si no se decodifica `BlioOrderCreated`.
+- `UserProxyDeployed(address indexed user, address proxy)`:
+  - Topic0: `0x0903bebe86eeecf23ff310ad0c3c7cca11bb1ced8c13c1b8c905c84b6b231f30`.
+  - Fuente: `BlioCheckoutIntegrator.sol:67`; emisión `:531`.
+  - Útil para indexar la relación usuario → proxy.
+
+## 8. Inventario del PR / rama
+
+`git diff --numstat main...HEAD` (solo adiciones, 1.284 líneas):
+
+| Archivo | Líneas añadidas | Propósito |
+| --- | ---: | --- |
+| `contracts/integrators/blio/BlioCheckoutIntegrator.sol` | 534 | Integrador de checkout de blio: productos, límites, `UserProxy`, callbacks y eventos. |
+| `contracts/integrators/blio/BlioTreasuryVault.sol` | 118 | Vault de tesorería con `recipient`/`affiliate` configurables y `distribute()` permissionless. |
+| `docs/integrators/blio.md` | 80 | Documentación operativa del integrador. |
+| `scripts/deploy-blio.ts` | 229 | Deploy + registro en el Diamond (`usdcThroughIntegrator = false`) + verificación de config. |
+| `scripts/set-blio-products.ts` | 95 | Configuración idempotente de productos 1..4. |
+| `test/blio-integrator.test.ts` | 228 | 19 tests del integrador contra `MockDiamond`. |
+
+Commits de la rama:
+
+```text
+21217e8 chore(blio): script de productos + baseTxLimit 100 en deploy
+14dae14 feat(blio): add BlioTreasuryVault as treasury target (whitelist #117)
+9e94605 fix(blio): add immutable MAX_ ceilings on owner-settable limits
+f62d41f feat(integrator): add BlioCheckoutIntegrator
+```
+
+No se tocaron otros archivos del repo.
+
+## 9. Baseline de pruebas
+
+Comando ejecutado (no hay `npm` usable en el servidor porque `/usr/local/lib/node_modules/npm` es `root:root 750`):
+
+```bash
+cd /home/xolvora/p2p/payment-integrators
+node ./node_modules/hardhat/internal/cli/cli.js test test/blio-integrator.test.ts
+```
+
+Resultado:
+
+```text
+19 passing (3s)
+```
+
+Es exactamente el baseline esperado: **19/19**.
+
+Suite completa (referencia):
+
+```bash
+node ./node_modules/hardhat/internal/cli/cli.js test
+# 986 passing (3m), 45 pending
+```
+
+Equivalentes habituales si `npm`/`npx` funcionan:
+
+```bash
+npm test
+# o
+npx hardhat test test/blio-integrator.test.ts
+```
+
+### Huecos de test relevantes
+
+- El test llamado “ignores cancel after completion” (`test/blio-integrator.test.ts:142-148`) **no llama** a `onOrderCancel`; solo comprueba que un segundo `simulateOrderComplete` revierte. No cubre el caso cancel-after-complete.
+- No hay test del comportamiento real por defecto `cancelCallbackEnabled = false` usando `simulateOrderCancelledNoCallback`.
+- No hay test con `recipientAddr` siendo un contrato (vault/Safe); solo EOA (`treasury` signer).
+- No hay test de `configReadable = false` (fallback por balance).
+
+## 10. Restricciones técnicas
+
+| Restricción | Valor / estado |
+| --- | --- |
+| Límite de runtime (EIP-170) | **24.576 bytes** |
+| Runtime de `BlioCheckoutIntegrator` | **7.400 bytes** (mucho margen) |
+| Runtime de `BlioTreasuryVault` | **2.312 bytes** |
+| Initcode de `BlioCheckoutIntegrator` | **11.413 bytes** (límite EIP-3860: 49.152) |
+| Solidity | Compilador **0.8.28**; pragma del contrato `^0.8.20` |
+| Settings | `evmVersion: "cancun"`, `viaIR: true`, optimizer `enabled`, `runs: 200` |
+| OpenZeppelin | **5.6.1** instalado (`package.json`: `^5.0.1`) |
+| `SafeERC20` | Disponible e importado (`BlioCheckoutIntegrator.sol:8`) |
+| `Ownable2Step` | Disponible e importado (`:11`); el contrato hereda de él (`:39`) |
+| `ReentrancyGuard` | Disponible e importado (`:12`) |
+| `Clones` | Disponible e importado (`:9`) |
+| `UserProxy` | Usa `transient` (EIP-1153); requiere Cancun, que Base soporta (`UserProxy.sol:64-74`) |
+| Upgradeability | No hay. `diamond`, `usdc`, `proxyImpl` y `treasury` son `immutable`; `proxyImpl` es set-once en el Diamond |
+| Límites duros del integrador | `MAX_BASE_TX_LIMIT = 5.000e6` (5.000 USDC), `MAX_DAILY_TX_COUNT_LIMIT = 100` (`BlioCheckoutIntegrator.sol:117-118`) |
+| Registro | `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)`; `proxyImpl` set-once (`docs/WHITELISTING.md:58-62`) |
+
+El límite de 24.576 bytes es el que ya obliga a `MerchantTerminalIntegrator` a usar `runs: 50` (`hardhat.config.ts:80-100`). Blio está muy por debajo, así que el rediseño puede añadir lógica sin acercarse al límite, salvo que se incorporen librerías grandes.
+
+## 11. Sorpresas y riesgos que cambian el plan
+
+1. **La dirección v1 del encargo es incorrecta.** `0x63460ae9552e0b7c3c1b4f4dcd2c4f7f0b1a6e5b` no tiene código. La real es `0x63460ae9566e9274d0034636B85243c216F2FD73`. Cualquier script o verificación que use la primera fallará o leerá vacío.
+
+2. **v1 usa una EOA como tesorería y como owner.** `0xb975…` tiene 0 bytes de código y es a la vez `treasury` y `owner`. La documentación (`docs/integrators/blio.md:61-62`) dice que ambos “deberían ser el multisig de blio”; el despliegue v1 no lo cumple. v2 sí lo corrige: vault + Safe v1.5.0 2-de-3.
+
+3. **`cancelCallbackEnabled = false` en v1 y v2.** En producción, el Diamond **no llama** `onOrderCancel` al cancelar un BUY. Consecuencia: el slot diario que `validateOrder` consumió no se libera en cancelaciones/expirables. El mock de tests sí llama al callback (`simulateOrderCancelled`), por lo que el test pasa pero no refleja el comportamiento real. Si el rediseño depende de `onOrderCancel`, hay que pedir al super-admin:
+   ```text
+   setIntegratorCancelCallback(<integrator>, true)
+   ```
+   o implementar reconciliación por `getOrdersById`/expiración en el backend.
+
+4. **`SettlementRoutingAnomaly` no reintenta ni resuelve.** Deja la sesión sin `fulfilled` y sin `BlioOrderCompleted`. El backend debe alertar y resolver manualmente (o con un job de reconciliación). No se debe conceder Premium por `BlioOrderCreated`.
+
+5. **Un callback que revierte no rompe el protocolo, pero pierde el evento.** El `try/catch` del Diamond es la red de seguridad; no hay reintento. Por eso el contrato no debe revertir en `onOrderComplete`/`onOrderCancel` y el indexer debe ser tolerante a logs faltantes.
+
+6. **Si el rediseño usa una Safe/smart account como `user` comprador**, el Diamond autoriza `paidBuyOrder` y `cancelOrder` contra `order.user`, no contra el que colocó ni contra `recipientAddr` (`IOrderFlow.sol:36-57`). Un relayer no podrá marcar pagado/cancelar en nombre de una Safe sin que la Safe ejecute la llamada. Para blio, el comprador debe seguir siendo la EOA/proxy que controla el flujo, o adaptar la UX.
+
+7. **El struct de `getIntegratorConfig` puede volver a crecer.** El contrato de blio lee el word 1 crudo y sobrevive a inserciones en medio; cualquier script que use un ABI tipado fijo se romperá silenciosamente. Mantener el decode por forma de `scripts/lib/diamond.ts`.
+
+8. **`usdcThroughIntegrator` puede re-afirmarse con `registerIntegrator`** (mismo `proxyImpl`). Un registro erróneo a `true` enviaría el USDC al integrador, no al treasury. Blio lo detecta, pero no lo recupera automáticamente. Hay que verificar el flag después de cada registro (el deploy script ya lo hace: `scripts/deploy-blio.ts:194-203`).
+
+9. **El token de pruebas no es el USDC de mainnet.** En Base Sepolia el token usado es `GG` (6 dec). No copiar direcciones de token entre redes.
+
+10. **El código del Diamond no está en este repo.** La verificación es contra interfaces, mock de conformidad y cadena real. Si el protocolo cambia el facet, hay que repetir las lecturas on-chain antes de la fase de implementación.
+
+## 12. Comandos de reproducción (sin `cast`)
+
+No hay `cast`/`forge` instalados en el servidor. Estos comandos usan `ethers` del propio repo y el RPC público:
+
+```bash
+cd /home/xolvora/p2p/payment-integrators
+node -e '
+const {ethers}=require("ethers");
+(async()=>{
+  const p=new ethers.JsonRpcProvider("https://sepolia.base.org");
+  const diamond="0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9";
+  const igs={
+    v1:"0x63460ae9566e9274d0034636B85243c216F2FD73",
+    v2:"0x239dd5df6f460c7df65072b0483e0fbf009f04a3"
+  };
+  for(const [k,ig] of Object.entries(igs)){
+    const raw=await p.call({to:diamond,data:"0x17353447"+ethers.zeroPadValue(ig,32).slice(2)});
+    const words=(raw.length-2)/64;
+    const types=words===5?["bool","bool","bool","uint256","address"]:["bool","bool","uint256","address"];
+    const v=ethers.AbiCoder.defaultAbiCoder().decode(["tuple("+types.join(",")+")"],raw)[0].toArray();
+    const c=new ethers.Contract(ig,[
+      "function treasury() view returns (address)",
+      "function baseTxLimit() view returns (uint256)",
+      "function dailyTxCountLimit() view returns (uint256)",
+      "function proxyImpl() view returns (address)"
+    ],p);
+    console.log(k, ig, words, v.map(x=>x.toString()));
+    console.log("  treasury", await c.treasury());
+    console.log("  baseTxLimit", (await c.baseTxLimit()).toString());
+    console.log("  dailyTxCountLimit", (await c.dailyTxCountLimit()).toString());
+    console.log("  proxyImpl", await c.proxyImpl());
+  }
+})();
+'
+```
+
+Equivalentes con `cast` (si se instala Foundry):
+
+```bash
+cast call 0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9 \
+  "getIntegratorConfig(address)(bool,bool,bool,uint256,address)" \
+  0x239dd5df6f460c7df65072b0483e0fbf009f04a3 \
+  --rpc-url https://sepolia.base.org
+
+cast call 0x239dd5df6f460c7df65072b0483e0fbf009f04a3 "treasury()(address)" --rpc-url https://sepolia.base.org
+cast call 0x239dd5df6f460c7df65072b0483e0fbf009f04a3 "baseTxLimit()(uint256)" --rpc-url https://sepolia.base.org
+cast call 0x239dd5df6f460c7df65072b0483e0fbf009f04a3 "dailyTxCountLimit()(uint256)" --rpc-url https://sepolia.base.org
+```
+
+## 13. Decisiones que debe cerrar la Fase 1
+
+1. **Destino de tesorería:** Safe directa o `BlioTreasuryVault` (vault + Safe). El vault ya está desplegado en v2 y permite split de afiliado y distribución permissionless; la Safe directa es más simple pero exige una transacción Safe para mover fondos.
+2. **Cancel callback:** pedir `setIntegratorCancelCallback(<nuevo integrator>, true)` o aceptar el leak de slots y reconciliar por backend.
+3. **Contrato nuevo vs reutilizar v2:** v2 ya tiene vault, Safe y `baseTxLimit=100`, `dailyTxCountLimit=100`. Cambiar `treasury` o `owner` en v2 no es posible (son inmutables en el integrador; el vault sí permite cambiar `recipient`). Si se quiere otra tesorería, hay que desplegar un integrador nuevo.
+4. **Indexación:** consumir `BlioOrderCompleted` con idempotencia por `orderId` y alerta por `SettlementRoutingAnomaly`; no conceder Premium por `BlioOrderCreated`.
+5. **Comprador:** mantener EOA/proxy como `user` para que `paidBuyOrder`/`cancelOrder` sigan siendo ejecutables; si se usa Safe/smart account, diseñar ese flujo explícitamente.
