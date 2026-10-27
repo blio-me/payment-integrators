@@ -194,22 +194,35 @@ attestation revierte con `NotAttested` (falla cerrado y su límite es cero).
 
 - **Tiers:** `1 = Liveness`, `2 = Passport`. Solo suben; intentar bajar revierte
   con `TierDowngrade`.
-- **Attestor:** dirección inmutable fijada en el constructor (`attestor()`). Es
-  la única llave que autoriza un tier; rotarla exige redeploy.
-- **Firma EIP-712:** dominio `("BlioCheckoutIntegrator", "1", chainId,
-  address(this))`; tipo
-  `Attestation(address user,uint8 tier,bytes32 nullifier,uint256 deadline)`.
-- **Envío:** `submitLivenessAttestation(user, tier, nullifier, deadline,
-  signature)` puede enviarla cualquiera (un relayer paga el gas); autoriza la
-  firma, no `msg.sender`.
-- **`deadline`:** cota de frescura del claim. No puede superar
-  `block.timestamp + MAX_ATTESTATION_DEADLINE` (15 minutos); un deadline lejano
-  o `type(uint256).max` revierte con `DeadlineTooFar`.
-- **TTL del tier:** tras `attestedAt`, el tier dura `ATTESTATION_TTL` (180 días,
-  expuesto en `attestationExpiresAt`). Al vencer, `_tierOf` devuelve `None`
-  (límite cero y `NotAttested` al colocar) y el comprador debe re-attestarse.
-- **`nullifier`:** de un solo uso (`usedNullifier`); no se puede replicar, ni
-  para otra wallet u otro tier (`NullifierUsed`).
+- **Dos attestors:** `livenessAttestor` y `kycAttestor`, inmutables, no nulos y
+  distintos entre sí (el constructor revierte `InvalidAddress`). Son las únicas
+  llaves que autorizan un tier; rotarlas exige redeploy.
+- **Dos dominios EIP-712** (separadores calculados en el constructor e
+  inmutables; `verifyingContract = address(this)`, `version = "1"`,
+  `chainId = block.chainid`):
+  - Liveness: nombre `LivenessVerifier`, tipo
+    `LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)`.
+  - Passport: nombre `KycVerifier`, tipo
+    `KycAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)`.
+  Se exponen con `livenessDomainSeparator()` y `kycDomainSeparator()`.
+- **Envío:** `submitLivenessAttestation(nullifier, limit, expiry, signature)`
+  (firma sobre `msg.sender`) y
+  `submitKycAttestation(wallet, nullifier, limit, expiry, signature)` (firma
+  sobre `wallet`, así que un relayer puede pagar el gas sin alterar el grant).
+  Autoriza la firma, no `msg.sender`.
+- **`limit`:** tope por transacción firmado por el servicio (6 decimales). El
+  efectivo es el firmado **solo si es menor** que la política de esa
+  moneda/tier; `0` o un valor **mayor** caen a la política. Nunca amplía el
+  techo: passport sigue en **100** (INR) / **200** (resto).
+- **`expiry`:** deadline de claim del servicio. Debe estar en el futuro y como
+  máximo a `MAX_ATTESTATION_DEADLINE` (15 minutos); si no, revierte
+  `DeadlineTooFar`. El grant grabado dura
+  `min(block.timestamp + ATTESTATION_TTL, expiry)`; al vencer, `_tierOf`
+  devuelve `None` (límite cero y `NotAttested` al colocar) y el comprador debe
+  re-attestarse.
+- **`nullifier`:** compartido entre ambos servicios y de un solo uso
+  (`usedNullifier`); no se puede replicar como KYC, ni para otra wallet u otro
+  tier (`NullifierUsed`).
 
 ### 4.2 Allowlist de monedas
 
@@ -400,16 +413,19 @@ event SettlementRoutingAnomaly(
 
 La tesorería intermedia no forma parte de esta rama: fue eliminada en la Fase 3.
 Esta revisión se apoya en `7037b8c` (allowlist de monedas y TTL/deadline de
-attestation).
+attestation) y en la Fase 6.6: dos attestors y dos dominios EIP-712 separados
+(`LivenessVerifier` / `KycVerifier`), con `limit` acotado por política.
 
 ## 9. Baseline de pruebas
 
 El baseline de **19 tests** de la Fase 0 quedó obsoleto. La rama añadió
-attestation (firma EIP-712, dominio, replay del nullifier, deadline, tier
-inválido, downgrade, relayer, comprador sin attestation), límites por moneda y
-nivel, cupo diario, Safe/contrato como treasury, reentrancy, idempotencia y
-footprint. La suite declara **61 casos** en `test/blio-integrator.test.ts` y
-**3** en `test/blio-integrator-poc.test.ts`; el número de "passing" se obtiene
+attestation (dos firmas EIP-712 con dominios y claves separadas, firma cruzada,
+`limit` acotado por política, replay compartido del nullifier, `expiry` y
+`DeadlineTooFar`, downgrade, relayer KYC, comprador sin attestation), límites
+por moneda y nivel, cupo diario, Safe/contrato como treasury, reentrancy,
+idempotencia y footprint. La suite declara **69 casos** en
+`test/blio-integrator.test.ts` y **3** en `test/blio-integrator-poc.test.ts`
+(**72 passing**); el número se obtiene
 ejecutando:
 
 ```bash
@@ -434,9 +450,11 @@ npx hardhat test test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 
 ### Cobertura actual
 
-- **Attestation:** firma válida/inválida, dominio incorrecto, replay de
-  `nullifier`, `deadline` vencido o demasiado lejano, TTL del tier, tier
-  inválido, downgrade, relayer y comprador sin attestation.
+- **Attestation:** cada attestor válido en su flujo, firma cruzada
+  (clave/tipo/dominio) → `InvalidSignature`, `limit` por encima y por debajo de
+  la política, `nullifier` compartido liveness→KYC, `expiry` vencido →
+  `NotAttested`, `DeadlineTooFar` a más de 15 min, downgrade, relayer KYC y
+  comprador sin attestation.
 - **Cancelación:** con `cancelCallbackEnabled = false`, una orden cancelada sin
   callback puede completarse y emitir Premium; el cupo no se libera.
 - **Treasury:** EOA y contrato tipo Safe.

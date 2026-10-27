@@ -38,7 +38,8 @@ import { getIntegratorConfig } from "./lib/diamond";
  *
  * Usage:
  *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] \
- *   [RECIPIENT_ADDR=0x...] ATTESTOR=0x... [DEPLOY_OWNER=0x...] \
+ *   [RECIPIENT_ADDR=0x...] LIVENESS_ATTESTOR=0x... KYC_ATTESTOR=0x... \
+ *   [DEPLOY_OWNER=0x...] \
  *   [DAILY_TX_COUNT_LIMIT=5] [DRY_RUN=1] [REGISTER=1] \
  *   npx hardhat run scripts/deploy-blio.ts --network base
  */
@@ -125,7 +126,8 @@ async function main() {
   const USDC_ADDRESS = process.env.USDC_ADDRESS || preset.usdc || "";
   const RECIPIENT_ADDR =
     process.env.RECIPIENT_ADDR || process.env.TREASURY || preset.recipient || "";
-  const ATTESTOR = process.env.ATTESTOR || "";
+  const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || "";
+  const KYC_ATTESTOR = process.env.KYC_ATTESTOR || "";
   const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer.address;
 
   console.log(`\n=== BlioCheckoutIntegrator — ${preset.label} (${chainId}) ===`);
@@ -145,9 +147,22 @@ async function main() {
   const recipient = requireChecksummed("RECIPIENT_ADDR", RECIPIENT_ADDR);
   if (recipient === ethers.ZeroAddress) throw new Error("RECIPIENT_ADDR must be non-zero");
 
-  if (!ATTESTOR) throw new Error("ATTESTOR is required — the KYC/liveness signer");
-  const attestor = requireChecksummed("ATTESTOR", ATTESTOR);
-  if (attestor === ethers.ZeroAddress) throw new Error("ATTESTOR must be non-zero");
+  if (!LIVENESS_ATTESTOR) {
+    throw new Error(
+      "LIVENESS_ATTESTOR is required — GET https://liveness-api.p2p.cool/v1/attestor"
+    );
+  }
+  if (!KYC_ATTESTOR) {
+    throw new Error("KYC_ATTESTOR is required — GET https://passport-api.p2p.cool/v1/attestor");
+  }
+  const livenessAttestor = requireChecksummed("LIVENESS_ATTESTOR", LIVENESS_ATTESTOR);
+  const kycAttestor = requireChecksummed("KYC_ATTESTOR", KYC_ATTESTOR);
+  if (livenessAttestor === ethers.ZeroAddress || kycAttestor === ethers.ZeroAddress) {
+    throw new Error("attestors must be non-zero");
+  }
+  if (livenessAttestor === kycAttestor) {
+    throw new Error("LIVENESS_ATTESTOR and KYC_ATTESTOR must be different signers");
+  }
 
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
@@ -193,7 +208,8 @@ async function main() {
   console.log(
     `  owner:            ${DEPLOY_OWNER}${DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a Safe)" : ""}`
   );
-  console.log(`  attestor:         ${attestor}`);
+  console.log(`  livenessAttestor: ${livenessAttestor}`);
+  console.log(`  kycAttestor:      ${kycAttestor}`);
   console.log(`  daily tx count:   ${DAILY_TX_COUNT_LIMIT}`);
   for (const l of DEFAULT_LIMITS) {
     console.log(`  limit ${l.label}: ${l.limit / 1_000_000n} USDC`);
@@ -215,7 +231,8 @@ async function main() {
     recipient,
     DEPLOY_OWNER,
     BigInt(DAILY_TX_COUNT_LIMIT),
-    attestor
+    livenessAttestor,
+    kycAttestor
   );
   await integrator.deploymentTransaction()?.wait(2);
   const integratorAddr = await integrator.getAddress();
@@ -331,7 +348,7 @@ async function main() {
   console.log(`NEXT_PUBLIC_P2P_CHAIN_ID=${chainId}`);
 
   const verifyNetwork = isMainnet ? "base" : "baseSepolia";
-  const verifyArgs = `${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${recipient} ${DEPLOY_OWNER} ${DAILY_TX_COUNT_LIMIT} ${attestor}`;
+  const verifyArgs = `${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${recipient} ${DEPLOY_OWNER} ${DAILY_TX_COUNT_LIMIT} ${livenessAttestor} ${kycAttestor}`;
   console.log("\n--- verify ---");
   console.log(`npx hardhat verify --network ${verifyNetwork} ${integratorAddr} ${verifyArgs}`);
   console.log(

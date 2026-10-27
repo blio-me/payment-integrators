@@ -24,18 +24,30 @@ describe("BlioCheckoutIntegrator", function () {
   const TIER_LIVENESS = 1n;
   const TIER_PASSPORT = 2n;
 
-  // Deterministic attestor / outsider keys, so the helper signs with an
-  // explicit `ethers.TypedDataEncoder` digest rather than a JSON-RPC signer
+  // Deterministic per-service attestor / outsider keys, so the helper signs with
+  // an explicit `ethers.TypedDataEncoder` digest rather than a JSON-RPC signer
   // (which would hide whether the test domain matches the contract's).
-  const attestor = new ethers.Wallet(ethers.keccak256(ethers.toUtf8Bytes("blio-test-attestor-v1")));
+  const livenessSigner = new ethers.Wallet(
+    ethers.keccak256(ethers.toUtf8Bytes("blio-test-liveness-v1"))
+  );
+  const kycSigner = new ethers.Wallet(ethers.keccak256(ethers.toUtf8Bytes("blio-test-kyc-v1")));
   const outsider = new ethers.Wallet(ethers.keccak256(ethers.toUtf8Bytes("blio-test-outsider-v1")));
 
-  const ATTESTATION_TYPES = {
-    Attestation: [
-      { name: "user", type: "address" },
-      { name: "tier", type: "uint8" },
+  const LIVENESS_TYPES = {
+    LivenessAttestation: [
+      { name: "wallet", type: "address" },
       { name: "nullifier", type: "bytes32" },
-      { name: "deadline", type: "uint256" },
+      { name: "limit", type: "uint256" },
+      { name: "expiry", type: "uint256" },
+    ],
+  };
+
+  const KYC_TYPES = {
+    KycAttestation: [
+      { name: "wallet", type: "address" },
+      { name: "nullifier", type: "bytes32" },
+      { name: "limit", type: "uint256" },
+      { name: "expiry", type: "uint256" },
     ],
   };
 
@@ -44,9 +56,9 @@ describe("BlioCheckoutIntegrator", function () {
     return BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
   }
 
-  async function attestationDomain(overrides: Record<string, unknown> = {}) {
+  async function livenessDomain(overrides: Record<string, unknown> = {}) {
     return {
-      name: "BlioCheckoutIntegrator",
+      name: "LivenessVerifier",
       version: "1",
       chainId: (await ethers.provider.getNetwork()).chainId,
       verifyingContract: await integrator.getAddress(),
@@ -54,42 +66,99 @@ describe("BlioCheckoutIntegrator", function () {
     } as any;
   }
 
-  /** Builds the exact EIP-712 digest the contract verifies. */
-  async function signAttestation(opts: {
-    user: string;
-    tier?: bigint;
+  async function kycDomain(overrides: Record<string, unknown> = {}) {
+    return {
+      name: "KycVerifier",
+      version: "1",
+      chainId: (await ethers.provider.getNetwork()).chainId,
+      verifyingContract: await integrator.getAddress(),
+      ...overrides,
+    } as any;
+  }
+
+  function freshNullifier(label: string, wallet: string) {
+    return ethers.keccak256(
+      ethers.toUtf8Bytes(`${label}:${wallet}:${Date.now()}:${Math.random()}`)
+    );
+  }
+
+  /** Builds the exact liveness EIP-712 digest the contract verifies. */
+  async function signLiveness(opts: {
+    wallet: string;
     nullifier?: string;
-    deadline?: bigint;
+    limit?: bigint;
+    expiry?: bigint;
     signer?: Wallet;
     domain?: Record<string, unknown>;
   }) {
-    const nullifier =
-      opts.nullifier ??
-      ethers.keccak256(ethers.toUtf8Bytes(`null:${opts.user}:${Date.now()}:${Math.random()}`));
-    const deadline = opts.deadline ?? (await now()) + 600n;
+    const nullifier = opts.nullifier ?? freshNullifier("liveness", opts.wallet);
+    const expiry = opts.expiry ?? (await now()) + 600n;
     const value = {
-      user: opts.user,
-      tier: opts.tier ?? TIER_LIVENESS,
+      wallet: opts.wallet,
       nullifier,
-      deadline,
+      limit: opts.limit ?? 0n,
+      expiry,
     };
-    const domain = await attestationDomain(opts.domain);
-    const digest = ethers.TypedDataEncoder.hash(domain, ATTESTATION_TYPES, value);
+    const domain = await livenessDomain(opts.domain);
+    const digest = ethers.TypedDataEncoder.hash(domain, LIVENESS_TYPES, value);
     const signature = ethers.Signature.from(
-      (opts.signer ?? attestor).signingKey.sign(digest)
+      (opts.signer ?? livenessSigner).signingKey.sign(digest)
     ).serialized;
     return { ...value, digest, signature };
   }
 
-  async function submit(who: SignerWithAddress, a: Awaited<ReturnType<typeof signAttestation>>) {
-    return integrator
-      .connect(who)
-      .submitLivenessAttestation(a.user, a.tier, a.nullifier, a.deadline, a.signature);
+  /** Builds the exact KYC EIP-712 digest the contract verifies. */
+  async function signKyc(opts: {
+    wallet: string;
+    nullifier?: string;
+    limit?: bigint;
+    expiry?: bigint;
+    signer?: Wallet;
+    domain?: Record<string, unknown>;
+  }) {
+    const nullifier = opts.nullifier ?? freshNullifier("kyc", opts.wallet);
+    const expiry = opts.expiry ?? (await now()) + 600n;
+    const value = {
+      wallet: opts.wallet,
+      nullifier,
+      limit: opts.limit ?? 0n,
+      expiry,
+    };
+    const domain = await kycDomain(opts.domain);
+    const digest = ethers.TypedDataEncoder.hash(domain, KYC_TYPES, value);
+    const signature = ethers.Signature.from(
+      (opts.signer ?? kycSigner).signingKey.sign(digest)
+    ).serialized;
+    return { ...value, digest, signature };
   }
 
-  async function attest(who: SignerWithAddress, tier = TIER_LIVENESS) {
-    const a = await signAttestation({ user: who.address, tier });
-    await submit(who, a);
+  type LivenessAttestation = Awaited<ReturnType<typeof signLiveness>>;
+  type KycAttestation = Awaited<ReturnType<typeof signKyc>>;
+
+  async function submitLiveness(submitter: SignerWithAddress, a: LivenessAttestation) {
+    return integrator
+      .connect(submitter)
+      .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature);
+  }
+
+  async function submitKyc(submitter: SignerWithAddress, a: KycAttestation) {
+    return integrator
+      .connect(submitter)
+      .submitKycAttestation(a.wallet, a.nullifier, a.limit, a.expiry, a.signature);
+  }
+
+  async function attest(
+    who: SignerWithAddress,
+    tier = TIER_LIVENESS,
+    opts: { limit?: bigint; expiry?: bigint } = {}
+  ) {
+    if (tier === TIER_LIVENESS) {
+      const a = await signLiveness({ wallet: who.address, ...opts });
+      await submitLiveness(who, a);
+      return a;
+    }
+    const a = await signKyc({ wallet: who.address, ...opts });
+    await submitKyc(who, a);
     return a;
   }
 
@@ -109,7 +178,8 @@ describe("BlioCheckoutIntegrator", function () {
       treasury.address,
       owner.address,
       DAILY_COUNT_LIMIT,
-      attestor.address
+      livenessSigner.address,
+      kycSigner.address
     );
 
     await mockDiamond.registerIntegrator(
@@ -265,7 +335,8 @@ describe("BlioCheckoutIntegrator", function () {
           treasury.address,
           owner.address,
           DAILY_COUNT_LIMIT + 1,
-          attestor.address
+          livenessSigner.address,
+          kycSigner.address
         )
       ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
     });
@@ -460,7 +531,8 @@ describe("BlioCheckoutIntegrator", function () {
           treasury.address,
           owner.address,
           DAILY_COUNT_LIMIT,
-          attestor.address
+          livenessSigner.address,
+          kycSigner.address
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
@@ -470,17 +542,64 @@ describe("BlioCheckoutIntegrator", function () {
           treasury.address,
           owner.address,
           DAILY_COUNT_LIMIT,
-          attestor.address
+          livenessSigner.address,
+          kycSigner.address
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
-        I.deploy(d, u, ethers.ZeroAddress, owner.address, DAILY_COUNT_LIMIT, attestor.address)
+        I.deploy(
+          d,
+          u,
+          ethers.ZeroAddress,
+          owner.address,
+          DAILY_COUNT_LIMIT,
+          livenessSigner.address,
+          kycSigner.address
+        )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
-        I.deploy(d, u, treasury.address, ethers.ZeroAddress, DAILY_COUNT_LIMIT, attestor.address)
+        I.deploy(
+          d,
+          u,
+          treasury.address,
+          ethers.ZeroAddress,
+          DAILY_COUNT_LIMIT,
+          livenessSigner.address,
+          kycSigner.address
+        )
       ).to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner");
       await expect(
-        I.deploy(d, u, treasury.address, owner.address, DAILY_COUNT_LIMIT, ethers.ZeroAddress)
+        I.deploy(
+          d,
+          u,
+          treasury.address,
+          owner.address,
+          DAILY_COUNT_LIMIT,
+          ethers.ZeroAddress,
+          kycSigner.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
+        I.deploy(
+          d,
+          u,
+          treasury.address,
+          owner.address,
+          DAILY_COUNT_LIMIT,
+          livenessSigner.address,
+          ethers.ZeroAddress
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
+        I.deploy(
+          d,
+          u,
+          treasury.address,
+          owner.address,
+          DAILY_COUNT_LIMIT,
+          livenessSigner.address,
+          livenessSigner.address
+        )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
@@ -510,10 +629,10 @@ describe("BlioCheckoutIntegrator", function () {
   });
 
   describe("Attestation gate", function () {
-    it("records the signed tier, spends the nullifier and applies its limits", async function () {
-      const a = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
+    it("records the signed liveness tier, spends the nullifier and applies its limits", async function () {
+      const a = await signLiveness({ wallet: user2.address });
 
-      await expect(submit(user2, a))
+      await expect(submitLiveness(user2, a))
         .to.emit(integrator, "AttestationSubmitted")
         .withArgs(user2.address, TIER_LIVENESS, a.nullifier);
 
@@ -534,38 +653,84 @@ describe("BlioCheckoutIntegrator", function () {
       await expect(place(user2, 10, INR)).to.not.be.reverted;
     });
 
+    it("accepts each service's attestor only in its own flow", async function () {
+      const liveness = await signLiveness({ wallet: user2.address });
+      await expect(submitLiveness(user2, liveness)).to.not.be.reverted;
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+
+      const kyc = await signKyc({ wallet: user2.address });
+      // The KYC signature can be relayed: `wallet`, not `msg.sender`, is bound.
+      await expect(submitKyc(owner, kyc)).to.emit(integrator, "AttestationSubmitted");
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
+    });
+
+    it("rejects a liveness signature made with the KYC key", async function () {
+      const a = await signLiveness({ wallet: user2.address, signer: kycSigner });
+      await expect(submitLiveness(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
+      expect(await integrator.tierOf(user2.address)).to.equal(0n);
+    });
+
+    it("rejects a KYC signature made with the liveness key", async function () {
+      const a = await signKyc({ wallet: user2.address, signer: livenessSigner });
+      await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
+      expect(await integrator.tierOf(user2.address)).to.equal(0n);
+    });
+
+    it("rejects a crossed type/domain (KYC struct under the LivenessVerifier domain)", async function () {
+      const a = await signKyc({
+        wallet: user2.address,
+        signer: livenessSigner,
+        domain: { name: "LivenessVerifier" },
+      });
+      await expect(submitLiveness(user2, a as any)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
+    });
+
     it("rejects a signature from another key", async function () {
-      const a = await signAttestation({ user: user2.address, signer: outsider });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+      const a = await signLiveness({ wallet: user2.address, signer: outsider });
+      await expect(submitLiveness(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
       expect(await integrator.tierOf(user2.address)).to.equal(0n);
     });
 
     it("rejects a signature for the wrong chainId", async function () {
-      const a = await signAttestation({
-        user: user2.address,
+      const a = await signLiveness({
+        wallet: user2.address,
         domain: { chainId: 999999 },
       });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+      await expect(submitLiveness(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
     });
 
     it("rejects a signature for the wrong verifyingContract", async function () {
-      const a = await signAttestation({
-        user: user2.address,
+      const a = await signKyc({
+        wallet: user2.address,
         domain: { verifyingContract: treasury.address },
       });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+      await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
     });
 
-    it("reverts NullifierUsed on a repeated nullifier", async function () {
-      const first = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
-      await submit(user2, first);
+    it("reverts NullifierUsed when a liveness nullifier is replayed as KYC", async function () {
+      const first = await signLiveness({ wallet: user2.address });
+      await submitLiveness(user2, first);
 
-      const replay = await signAttestation({
-        user: user2.address,
-        tier: TIER_PASSPORT,
-        nullifier: first.nullifier,
-      });
-      await expect(submit(user2, replay)).to.be.revertedWithCustomError(
+      const replay = await signKyc({ wallet: user2.address, nullifier: first.nullifier });
+      await expect(submitKyc(user2, replay)).to.be.revertedWithCustomError(
         integrator,
         "NullifierUsed"
       );
@@ -573,12 +738,9 @@ describe("BlioCheckoutIntegrator", function () {
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
     });
 
-    it("reverts AttestationExpired past the deadline", async function () {
-      const a = await signAttestation({
-        user: user2.address,
-        deadline: (await now()) - 60n,
-      });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(
+    it("reverts AttestationExpired when the signed expiry has already passed", async function () {
+      const a = await signKyc({ wallet: user2.address, expiry: (await now()) - 60n });
+      await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(
         integrator,
         "AttestationExpired"
       );
@@ -586,60 +748,112 @@ describe("BlioCheckoutIntegrator", function () {
 
     it("reverts DeadlineTooFar past the 15-minute cap", async function () {
       const t = await now();
-      // Pin the next block to t+1 so `deadline = t+902` is exactly one second
+      // Pin the next block to t+1 so `expiry = t+902` is exactly one second
       // beyond `block.timestamp + MAX_ATTESTATION_DEADLINE`.
       await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t) + 1]);
-      const a = await signAttestation({ user: user2.address, deadline: t + 902n });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "DeadlineTooFar");
+      const a = await signKyc({ wallet: user2.address, expiry: t + 902n });
+      await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(integrator, "DeadlineTooFar");
       expect(await integrator.tierOf(user2.address)).to.equal(0n);
     });
 
-    it("accepts a deadline within the cap", async function () {
-      const a = await signAttestation({
-        user: user2.address,
-        deadline: (await now()) + 600n,
-      });
-      await expect(submit(user2, a)).to.not.be.reverted;
-      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+    it("accepts a KYC expiry within the cap", async function () {
+      const a = await signKyc({ wallet: user2.address, expiry: (await now()) + 600n });
+      await expect(submitKyc(user2, a)).to.not.be.reverted;
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
     });
 
-    it("expires the recorded tier after ATTESTATION_TTL", async function () {
-      const a = await attest(user2, TIER_LIVENESS);
-      const expiresAt = await integrator.attestationExpiresAt(user2.address);
-      const attestedAt = await integrator.attestedAt(user2.address);
-      expect(expiresAt).to.equal(attestedAt + (await integrator.ATTESTATION_TTL()));
+    it("expires a KYC grant at its signed expiry: placement reverts NotAttested", async function () {
+      const expiresAt = await (async () => (await now()) + 600n)();
+      const a = await signKyc({ wallet: user2.address, expiry: expiresAt });
+      await submitKyc(user2, a);
 
-      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
+      expect(await integrator.attestationExpiresAt(user2.address)).to.equal(expiresAt);
+      await expect(place(user2, 1, INR)).to.not.be.reverted;
 
-      await ethers.provider.send("evm_increaseTime", [
-        Number(await integrator.ATTESTATION_TTL()) + 1,
-      ]);
+      await ethers.provider.send("evm_increaseTime", [601]);
       await ethers.provider.send("evm_mine", []);
 
       // Raw tier is still stored, but the gate treats it as None.
-      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
       expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
-      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(0n);
+      await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
+    });
+
+    it("caps the recorded grant at min(expiry, ATTESTATION_TTL)", async function () {
+      const a = await attest(user2, TIER_LIVENESS);
+      const expiresAt = await integrator.attestationExpiresAt(user2.address);
+      const attestedAt = await integrator.attestedAt(user2.address);
+      expect(expiresAt).to.equal(a.expiry);
+      expect(expiresAt).to.be.lessThan(attestedAt + (await integrator.ATTESTATION_TTL()));
+
+      await ethers.provider.send("evm_increaseTime", [601]);
+      await ethers.provider.send("evm_mine", []);
+
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
       await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
 
-      // A fresh attestation revives it and resets the TTL.
-      const fresh = await signAttestation({ user: user2.address, nullifier: a.nullifier });
-      await expect(submit(user2, fresh)).to.be.revertedWithCustomError(integrator, "NullifierUsed");
-      const reattest = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
-      await expect(submit(user2, reattest)).to.not.be.reverted;
+      // A fresh attestation revives it (the old nullifier is single-use).
+      const replay = await signLiveness({ wallet: user2.address, nullifier: a.nullifier });
+      await expect(submitLiveness(user2, replay)).to.be.revertedWithCustomError(
+        integrator,
+        "NullifierUsed"
+      );
+      const reattest = await signLiveness({ wallet: user2.address });
+      await expect(submitLiveness(user2, reattest)).to.not.be.reverted;
       expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
     });
 
-    it("reverts InvalidTier for a tier outside Liveness/Passport", async function () {
-      const a = await signAttestation({ user: user2.address, tier: 3n });
-      await expect(submit(user2, a)).to.be.revertedWithCustomError(integrator, "InvalidTier");
+    it("clamps a KYC limit above policy to 100/200", async function () {
+      await attest(user2, TIER_PASSPORT, { limit: USDC(500) });
+
+      expect(await integrator.attestedLimit(user2.address)).to.equal(USDC(500));
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(200));
+      await expect(place(user2, 11, INR)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+      await expect(place(user2, 21, BRL)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+    });
+
+    it("respects a KYC limit below policy", async function () {
+      await attest(user2, TIER_PASSPORT, { limit: USDC(30) });
+
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(30));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(30));
+      await expect(place(user2, 3, INR)).to.not.be.reverted;
+      await expect(place(user2, 4, INR)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+    });
+
+    it("treats a zero KYC limit as 'use the policy'", async function () {
+      await attest(user2, TIER_PASSPORT, { limit: 0n });
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(200));
+    });
+
+    it("also clamps a liveness limit to its policy ceiling", async function () {
+      await attest(user2, TIER_LIVENESS, { limit: USDC(999) });
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(50));
+
+      await attest(user2, TIER_LIVENESS, { limit: USDC(5) });
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(5));
     });
 
     it("rejects a downgrade from Passport to Liveness", async function () {
       await attest(user2, TIER_PASSPORT);
 
-      const down = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
-      await expect(submit(user2, down)).to.be.revertedWithCustomError(integrator, "TierDowngrade");
+      const down = await signLiveness({ wallet: user2.address });
+      await expect(submitLiveness(user2, down)).to.be.revertedWithCustomError(
+        integrator,
+        "TierDowngrade"
+      );
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
       // A rejected downgrade must not burn the nullifier.
       expect(await integrator.usedNullifier(down.nullifier)).to.equal(false);
@@ -649,15 +863,21 @@ describe("BlioCheckoutIntegrator", function () {
       await expect(place(user2, 1)).to.be.revertedWithCustomError(integrator, "NotAttested");
     });
 
-    it("lets a relayer submit the attestor's signature for the buyer", async function () {
-      const a = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
-      await expect(submit(owner, a)).to.emit(integrator, "AttestationSubmitted");
-      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+    it("lets a relayer submit the KYC attestor's signature for the buyer", async function () {
+      const a = await signKyc({ wallet: user2.address });
+      await expect(submitKyc(owner, a)).to.emit(integrator, "AttestationSubmitted");
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
     });
 
-    it("exposes the EIP-712 domain the attestor signs under", async function () {
-      expect(await integrator.domainSeparator()).to.equal(
-        ethers.TypedDataEncoder.hashDomain(await attestationDomain())
+    it("exposes the two EIP-712 domains the attestors sign under", async function () {
+      expect(await integrator.livenessDomainSeparator()).to.equal(
+        ethers.TypedDataEncoder.hashDomain(await livenessDomain())
+      );
+      expect(await integrator.kycDomainSeparator()).to.equal(
+        ethers.TypedDataEncoder.hashDomain(await kycDomain())
+      );
+      expect(await integrator.livenessDomainSeparator()).to.not.equal(
+        await integrator.kycDomainSeparator()
       );
     });
   });
@@ -702,7 +922,8 @@ describe("BlioCheckoutIntegrator", function () {
         safeAddr,
         owner.address,
         DAILY_COUNT_LIMIT,
-        attestor.address
+        livenessSigner.address,
+        kycSigner.address
       );
       await mockDiamond.registerIntegrator(
         await safeIntegrator.getAddress(),
@@ -750,24 +971,17 @@ describe("BlioCheckoutIntegrator", function () {
     });
 
     it("rejects a duplicate nullifier and a signature from another key", async function () {
-      const first = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
-      await submit(user2, first);
+      const first = await signLiveness({ wallet: user2.address });
+      await submitLiveness(user2, first);
 
-      const replay = await signAttestation({
-        user: user2.address,
-        tier: TIER_PASSPORT,
-        nullifier: first.nullifier,
-      });
-      await expect(submit(user2, replay)).to.be.revertedWithCustomError(
+      const replay = await signKyc({ wallet: user2.address, nullifier: first.nullifier });
+      await expect(submitKyc(user2, replay)).to.be.revertedWithCustomError(
         integrator,
         "NullifierUsed"
       );
 
-      const wrongKey = await signAttestation({
-        user: user2.address,
-        signer: outsider,
-      });
-      await expect(submit(user2, wrongKey)).to.be.revertedWithCustomError(
+      const wrongKey = await signLiveness({ wallet: user2.address, signer: outsider });
+      await expect(submitLiveness(user2, wrongKey)).to.be.revertedWithCustomError(
         integrator,
         "InvalidSignature"
       );
@@ -827,7 +1041,8 @@ describe("BlioCheckoutIntegrator", function () {
         treasury.address,
         owner.address,
         DAILY_COUNT_LIMIT,
-        attestor.address
+        livenessSigner.address,
+        kycSigner.address
       );
       await guarded.setProductPrice(PRODUCT_ID, PRODUCT_PRICE);
       await guarded.setProductActive(PRODUCT_ID, true);

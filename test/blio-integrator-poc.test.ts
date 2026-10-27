@@ -28,14 +28,17 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
   const BRL = ethers.encodeBytes32String("BRL");
   const TIER_LIVENESS = 1n;
 
-  const attestor = new ethers.Wallet(ethers.keccak256(ethers.toUtf8Bytes("blio-poc-attestor-v1")));
+  const livenessSigner = new ethers.Wallet(
+    ethers.keccak256(ethers.toUtf8Bytes("blio-poc-liveness-v1"))
+  );
+  const kycSigner = new ethers.Wallet(ethers.keccak256(ethers.toUtf8Bytes("blio-poc-kyc-v1")));
 
-  const ATTESTATION_TYPES = {
-    Attestation: [
-      { name: "user", type: "address" },
-      { name: "tier", type: "uint8" },
+  const LIVENESS_TYPES = {
+    LivenessAttestation: [
+      { name: "wallet", type: "address" },
       { name: "nullifier", type: "bytes32" },
-      { name: "deadline", type: "uint256" },
+      { name: "limit", type: "uint256" },
+      { name: "expiry", type: "uint256" },
     ],
   };
 
@@ -43,23 +46,21 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
     return BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
   }
 
-  async function attest(who: SignerWithAddress, tier = TIER_LIVENESS) {
+  async function attest(who: SignerWithAddress, limit = 0n) {
     const nullifier = ethers.keccak256(
       ethers.toUtf8Bytes(`poc:${who.address}:${Date.now()}:${Math.random()}`)
     );
-    const deadline = (await now()) + 600n;
-    const value = { user: who.address, tier, nullifier, deadline };
+    const expiry = (await now()) + 600n;
+    const value = { wallet: who.address, nullifier, limit, expiry };
     const domain = {
-      name: "BlioCheckoutIntegrator",
+      name: "LivenessVerifier",
       version: "1",
       chainId: (await ethers.provider.getNetwork()).chainId,
       verifyingContract: await integrator.getAddress(),
     };
-    const digest = ethers.TypedDataEncoder.hash(domain, ATTESTATION_TYPES, value);
-    const signature = ethers.Signature.from(attestor.signingKey.sign(digest)).serialized;
-    await integrator
-      .connect(who)
-      .submitLivenessAttestation(who.address, tier, nullifier, deadline, signature);
+    const digest = ethers.TypedDataEncoder.hash(domain, LIVENESS_TYPES, value);
+    const signature = ethers.Signature.from(livenessSigner.signingKey.sign(digest)).serialized;
+    await integrator.connect(who).submitLivenessAttestation(nullifier, limit, expiry, signature);
   }
 
   async function place(signer: SignerWithAddress = user, quantity = 1, currency = INR) {
@@ -82,7 +83,8 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
       treasury.address,
       owner.address,
       DAILY_COUNT_LIMIT,
-      attestor.address
+      livenessSigner.address,
+      kycSigner.address
     );
 
     await mockDiamond.registerIntegrator(

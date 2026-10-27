@@ -75,56 +75,75 @@ A buyer with no attestation has `Tier.None` and a **zero** limit. The checkout
 fails closed: `userPlaceOrder` reverts with `NotAttested` until a valid
 signature is submitted.
 
+p2p uses **two independent signers** and **two EIP-712 domains**, so a liveness
+signature can never be replayed as KYC (or the reverse):
+
+| Service | Function | Attestor | Domain name | Type |
+| --- | --- | --- | --- | --- |
+| Liveness | `submitLivenessAttestation(nullifier, limit, expiry, signature)` | `livenessAttestor` (`0x6cC7…2978`) | `LivenessVerifier` | `LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)` |
+| Passport/KYC | `submitKycAttestation(wallet, nullifier, limit, expiry, signature)` | `kycAttestor` (`0xA0bE…3Eda`) | `KycVerifier` | `KycAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)` |
+
+`verifyingContract = <integrator address>`, `version = "1"`,
+`chainId = block.chainid`. Both domain separators are exposed
+(`livenessDomainSeparator()`, `kycDomainSeparator()`) and are computed once in
+the constructor as immutables.
+
 - **Tiers:** `1 = Liveness`, `2 = Passport`. Grants are monotonic: an
   attestation can raise the tier but never lower it (`TierDowngrade`).
-- **Attestor:** an immutable address fixed in the constructor (`ATTESTOR`).
-  It is the only key that can authorize a tier. Rotating it requires a
-  redeploy — no owner key can mint tiers after the fact.
-- **Domain (EIP-712):**
-  `EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`
-  with `name = "BlioCheckoutIntegrator"`, `version = "1"`,
-  `chainId = block.chainid`, `verifyingContract = <integrator address>`.
-  `domainSeparator()` returns it.
-- **Type:**
-  `Attestation(address user,uint8 tier,bytes32 nullifier,uint256 deadline)`.
-- **Submission:** `submitLivenessAttestation(user, tier, nullifier, deadline, signature)`.
-  Anyone may submit it (a relayer can pay gas); the signature, not
-  `msg.sender`, authorizes the grant.
-- **`deadline`:** claim freshness bound. The claim must land at or before it,
-  and it cannot be more than `MAX_ATTESTATION_DEADLINE` (15 minutes) in the
-  future — a far-future or `type(uint256).max` deadline reverts
-  `DeadlineTooFar`.
-- **Tier TTL:** a recorded tier stays usable for `ATTESTATION_TTL` (180 days)
-  after `attestedAt`; `attestationExpiresAt` exposes the cutoff. Past it,
-  `_tierOf` reports `None` (zero limit, `NotAttested` on placement) and the
-  buyer must be re-attested.
-- **Nullifier:** a per-human Sybil nullifier from the KYC service. It is
-  single-use (`usedNullifier`), so the same grant can never be replayed, even
-  for another wallet or tier. Reuse reverts with `NullifierUsed`.
+- **Attestors:** immutable, non-zero and distinct (constructor reverts
+  `InvalidAddress` otherwise). Rotating one requires a redeploy — no owner key
+  can mint tiers after the fact.
+- **`limit`:** the signed per-tx ceiling (6dp). The effective limit is the
+  signed value only when it is **below** the policy for that currency/tier;
+  `0` or anything **above** the policy falls back to the policy. It can never
+  widen a cap, so passport stays at **100** (INR) / **200** (other).
+- **`expiry`:** the service's claim deadline. It must be strictly in the
+  future and at most `MAX_ATTESTATION_DEADLINE` (15 minutes) ahead, or the call
+  reverts `DeadlineTooFar`. The recorded grant lives until
+  `min(block.timestamp + ATTESTATION_TTL, expiry)`; past it `_tierOf` reports
+  `None` (zero limit, `NotAttested` on placement) and the buyer must be
+  re-attested.
+- **`wallet`:** liveness binds `msg.sender`; KYC binds the explicit `wallet`
+  argument, so a relayer (e.g. the gas service) may land it without changing
+  the grant.
+- **Nullifier:** shared across both services and single-use (`usedNullifier`),
+  so a liveness nullifier cannot be replayed as KYC, another wallet or another
+  tier. Reuse reverts with `NullifierUsed`.
 
 Signing sketch (ethers):
 
 ```ts
-const domain = {
-  name: "BlioCheckoutIntegrator",
+const livenessDomain = {
+  name: "LivenessVerifier",
   version: "1",
   chainId,
   verifyingContract: integrator,
 };
-const types = {
-  Attestation: [
-    { name: "user", type: "address" },
-    { name: "tier", type: "uint8" },
-    { name: "nullifier", type: "bytes32" },
-    { name: "deadline", type: "uint256" },
-  ],
+const kycDomain = {
+  name: "KycVerifier",
+  version: "1",
+  chainId,
+  verifyingContract: integrator,
 };
-const signature = await attestorSigner.signTypedData(domain, types, {
-  user,
-  tier: 1,
-  nullifier,
-  deadline,
-});
+
+const fields = [
+  { name: "wallet", type: "address" },
+  { name: "nullifier", type: "bytes32" },
+  { name: "limit", type: "uint256" },
+  { name: "expiry", type: "uint256" },
+];
+
+const livenessSignature = await livenessSigner.signTypedData(
+  livenessDomain,
+  { LivenessAttestation: fields },
+  { wallet, nullifier, limit, expiry }
+);
+
+const kycSignature = await kycSigner.signTypedData(
+  kycDomain,
+  { KycAttestation: fields },
+  { wallet, nullifier, limit, expiry }
+);
 ```
 
 ## End-to-end flow
@@ -171,11 +190,15 @@ event — reconcile manually and alert.
   pause; `treasury` receives settlement. Both should be the Safe
   (`0xFB25…`). The deploy script refuses to default the owner to the deployer
   EOA on mainnet.
-- **Attestor.** A non-zero, dedicated signer must be provided via `ATTESTOR`.
-  It is immutable per deployment.
+- **Attestors.** Two non-zero, distinct signers must be provided via
+  `LIVENESS_ATTESTOR` and `KYC_ATTESTOR` (from
+  `https://liveness-api.p2p.cool/v1/attestor` and
+  `https://passport-api.p2p.cool/v1/attestor`). Both are immutable per
+  deployment.
 - **On-chain verification.** Verify the integrator source (Blockscout or
   Etherscan) with the exact constructor arguments, then read
-  `diamond()`, `usdc()`, `treasury()`, `attestor()`, `proxyImpl()`,
+  `diamond()`, `usdc()`, `treasury()`, `livenessAttestor()`, `kycAttestor()`,
+  `proxyImpl()`,
   `dailyTxCountLimit()` and the four `limitFor()` entries and confirm they
   match the policy. Confirm the Diamond registration is
   `usdcThroughIntegrator = false` and `cancelCallbackEnabled = false`.
@@ -205,18 +228,24 @@ settlement token is the `GG` mock above, not Circle USDC.
 ```bash
 # Base Sepolia — use test accounts for recipient/owner; presets fill Diamond + USDC.
 RECIPIENT_ADDR=0xYourSepoliaTestAccount \
-ATTESTOR=0xYourAttestorSigner \
+LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978 \
+KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda \
 DEPLOY_OWNER=0xYourSepoliaTestAccount \
   npx hardhat run scripts/deploy-blio.ts --network baseSepolia
 
 # Base mainnet — recipient and owner are the blio Safe.
 RECIPIENT_ADDR=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
-ATTESTOR=0x... DEPLOY_OWNER=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
+LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978 \
+KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda \
+DEPLOY_OWNER=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
   npx hardhat run scripts/deploy-blio.ts --network base
 
 # Deploy and register (requires the Diamond super-admin key; REGISTER=1 because
 # Hardhat rejects custom --flags):
-RECIPIENT_ADDR=0x... ATTESTOR=0x... DEPLOY_OWNER=0x... REGISTER=1 \
+RECIPIENT_ADDR=0x... \
+LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978 \
+KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda \
+DEPLOY_OWNER=0x... REGISTER=1 \
   npx hardhat run scripts/deploy-blio.ts --network baseSepolia
 ```
 
