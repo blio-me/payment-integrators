@@ -40,7 +40,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     using SafeERC20 for IERC20;
 
     /// @notice Buyer verification tier. `None` means no attestation and gets a
-    ///         zero limit once the Phase 2 gate lands.
+    ///         zero limit — the contract fails closed until the user submits a
+    ///         valid attestation (see `submitLivenessAttestation`).
     enum Tier {
         None,
         Liveness,
@@ -64,6 +65,18 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     error CapExceedsCeiling();
     error InvalidTier();
 
+    // KYC / attestation
+    /// @notice The buyer has no attestation; the checkout is closed to them.
+    error NotAttested();
+    /// @notice The attestation's claim deadline has already passed.
+    error AttestationExpired();
+    /// @notice The nullifier was already consumed by a previous attestation.
+    error NullifierUsed();
+    /// @notice The signature did not recover to the immutable attestor.
+    error InvalidSignature();
+    /// @notice An attestation can only raise the tier, never lower it.
+    error TierDowngrade();
+
     // ─── Events ───────────────────────────────────────────────────────
 
     event ProductPriceSet(uint256 indexed productId, uint256 price);
@@ -74,6 +87,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     event Unpaused(address indexed account);
     event UserProxyDeployed(address indexed user, address proxy);
     event UsdcSwept(address indexed to, uint256 amount);
+
+    /// @notice A buyer's verification tier was recorded from a valid attestor
+    ///         signature. `nullifier` is single-use (Sybil resistance).
+    event AttestationSubmitted(address indexed user, uint8 indexed tier, bytes32 nullifier);
 
     /// @notice Emitted for every accepted placement so the widget / backend can
     ///         read the product metadata from a single receipt.
@@ -116,6 +133,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     address public immutable proxyImpl;
     /// @notice Where the Diamond settles the USDC. Never this contract.
     address public immutable treasury;
+    /// @notice Signer of the KYC/liveness attestations. Immutable: rotating it
+    ///         requires a redeploy, which is the point — no owner key can mint
+    ///         tiers or rewrite trust after the fact.
+    address public immutable attestor;
 
     // ─── Immutable policy ceilings ────────────────────────────────────
     // Compiled into the bytecode. The constructor and every owner setter are
@@ -135,6 +156,18 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     /// @notice Wildcard bucket every non-INR currency normalizes to.
     bytes32 public constant OTHER_CURRENCY = bytes32(0);
 
+    // ─── EIP-712 constants ────────────────────────────────────────────
+
+    /// @dev keccak256("Attestation(address user,uint8 tier,bytes32 nullifier,uint256 deadline)")
+    bytes32 private constant _ATTESTATION_TYPEHASH =
+        keccak256("Attestation(address user,uint8 tier,bytes32 nullifier,uint256 deadline)");
+    bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
+        keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        );
+    bytes32 private constant _DOMAIN_NAME = keccak256(bytes("BlioCheckoutIntegrator"));
+    bytes32 private constant _DOMAIN_VERSION = keccak256(bytes("1"));
+
     // ─── Configurable limits ──────────────────────────────────────────
 
     /// @dev Effective per-tx USDC cap by normalized currency and tier
@@ -145,10 +178,15 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     uint256 public dailyTxCountLimit;
     bool public paused;
 
-    /// @notice Buyer verification tier, populated by the Phase 2 attestation
-    ///         gate. Empty until then; `_tierOf` defaults to `Liveness` so the
-    ///         current checkout keeps working.
+    /// @notice Buyer verification tier, written only by a valid attestation.
+    ///         `None` is the default and grants a zero limit.
     mapping(address => Tier) public tierOf;
+    /// @notice Timestamp of the last accepted attestation for each buyer.
+    mapping(address => uint256) public attestedAt;
+    /// @notice Per-(tenant, human) Sybil nullifiers already consumed. Once a
+    ///         nullifier is used it can never be replayed, even for another
+    ///         tier or another wallet.
+    mapping(bytes32 => bool) public usedNullifier;
 
     // ─── Products ─────────────────────────────────────────────────────
 
@@ -202,19 +240,24 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      *                      Transferable two-step via `transferOwnership` /
      *                      `acceptOwnership`.
      * @param _dailyTxCount Placements per user per day (max 5).
+     * @param _attestor     Signer of the KYC/liveness attestations. Immutable:
+     *                      must be non-zero, otherwise no buyer could ever be
+     *                      attested and the checkout would be permanently shut.
      */
     constructor(
         address _diamond,
         address _usdc,
         address _treasury,
         address _owner,
-        uint256 _dailyTxCount
+        uint256 _dailyTxCount,
+        address _attestor
     ) Ownable(_owner) {
         if (
             _diamond == address(0) ||
             _usdc == address(0) ||
             _treasury == address(0) ||
-            _owner == address(0)
+            _owner == address(0) ||
+            _attestor == address(0)
         ) revert InvalidAddress();
         if (_dailyTxCount == 0) revert InvalidQuantity();
         if (_dailyTxCount > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
@@ -222,6 +265,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         diamond = _diamond;
         usdc = IERC20(_usdc);
         treasury = _treasury;
+        attestor = _attestor;
         dailyTxCountLimit = _dailyTxCount;
 
         // Seed the whole matrix at its immutable ceiling. Non-INR currencies
@@ -289,6 +333,57 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         emit UsdcSwept(to, amount);
     }
 
+    // ─── Attestations ─────────────────────────────────────────────────
+
+    /**
+     * @notice Record the verification tier the attestor signed for `user`.
+     *
+     * @dev    The signature is an EIP-712 `Attestation(address user,uint8 tier,
+     *         bytes32 nullifier,uint256 deadline)` under the domain
+     *         `("BlioCheckoutIntegrator", "1", block.chainid, address(this))`.
+     *         It may be submitted by anyone (a relayer can pay the gas); the
+     *         signature — not `msg.sender` — authorizes the grant.
+     *
+     *         `deadline` is a claim-freshness bound only, mirroring the
+     *         investabl-challenge pattern: it stops a stale signature from
+     *         being redeemed much later, but the tier itself does not expire.
+     *         The nullifier is single-use, so a grant can never be re-claimed.
+     *
+     *         Tiers are monotonic: an attestation can only raise the buyer's
+     *         level. An attempt to go back down (Passport -> Liveness) reverts
+     *         with `TierDowngrade` rather than being silently ignored, so a
+     *         mis-ordered batch is visible to the caller.
+     *
+     * @param user      Buyer the attestation is for.
+     * @param tier      1 = Liveness, 2 = Passport. Anything else reverts.
+     * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
+     * @param deadline  Unix seconds; the claim must land at or before this.
+     * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from `attestor`.
+     */
+    function submitLivenessAttestation(
+        address user,
+        uint8 tier,
+        bytes32 nullifier,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        if (user == address(0)) revert InvalidAddress();
+        if (block.timestamp > deadline) revert AttestationExpired();
+        if (tier != uint8(Tier.Liveness) && tier != uint8(Tier.Passport)) revert InvalidTier();
+        if (usedNullifier[nullifier]) revert NullifierUsed();
+
+        bytes32 digest = _attestationDigest(user, tier, nullifier, deadline);
+        if (_recover(digest, signature) != attestor) revert InvalidSignature();
+
+        if (tier < uint8(tierOf[user])) revert TierDowngrade();
+
+        usedNullifier[nullifier] = true;
+        tierOf[user] = Tier(tier);
+        attestedAt[user] = block.timestamp;
+
+        emit AttestationSubmitted(user, tier, nullifier);
+    }
+
     // ─── User-facing placement ────────────────────────────────────────
 
     /**
@@ -310,6 +405,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ) external nonReentrant returns (uint256 orderId) {
         if (paused) revert ContractPaused();
         if (quantity == 0) revert InvalidQuantity();
+        if (tierOf[msg.sender] == Tier.None) revert NotAttested();
 
         uint256 price = productPrice[productId];
         if (price == 0) revert ProductNotFound();
@@ -405,6 +501,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             pending.currency != currency
         ) return false;
 
+        // Authoritative attestation gate: an unattested buyer can never place an
+        // order, and unlike the amount/daily checks this reverts (rather than
+        // returning false) so the reason is visible in the receipt.
+        if (tierOf[user] == Tier.None) revert NotAttested();
+
         if (amount == 0) return false;
         if (amount > userTxLimitFor(user, currency)) return false;
 
@@ -494,6 +595,20 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         return userTxLimitFor(msg.sender, currency);
     }
 
+    /// @notice EIP-712 domain separator the attestor signs under.
+    function domainSeparator() public view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    _EIP712_DOMAIN_TYPEHASH,
+                    _DOMAIN_NAME,
+                    _DOMAIN_VERSION,
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
     /// @notice Currency class the limit matrix is keyed by: INR is its own
     ///         bucket and every other currency shares `OTHER_CURRENCY`.
     function normalizeCurrency(bytes32 currency) public pure returns (bytes32) {
@@ -512,11 +627,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         return 0;
     }
 
-    /// @dev TODO(Fase 2): once the attestation gate exists, return `tierOf[user]`
-    ///      directly — an unattested buyer (`None`) must have a zero limit.
+    /// @dev The recorded tier, or `None` — which `userTxLimitFor` maps to a zero
+    ///      limit, so an unattested buyer cannot transact.
     function _tierOf(address user) internal view returns (Tier) {
-        Tier tier = tierOf[user];
-        return tier == Tier.None ? Tier.Liveness : tier;
+        return tierOf[user];
     }
 
     function getRemainingDailyCount(address user) external view returns (uint256) {
@@ -563,6 +677,40 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             flag := mload(add(ret, 0x40))
         }
         return (flag != 0, true);
+    }
+
+    // ─── Internal: EIP-712 attestation verification ───────────────────
+
+    function _attestationDigest(
+        address user,
+        uint8 tier,
+        bytes32 nullifier,
+        uint256 deadline
+    ) private view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(_ATTESTATION_TYPEHASH, user, tier, nullifier, deadline)
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+    }
+
+    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
+        if (sig.length != 65) revert InvalidSignature();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        // Reject the high-`s` half of each signature (EIP-2): otherwise every
+        // signature has a malleated twin that recovers the same signer.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0)
+            revert InvalidSignature();
+        if (v != 27 && v != 28) revert InvalidSignature();
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert InvalidSignature();
+        return signer;
     }
 
     function _salt(address user) internal pure returns (bytes32) {

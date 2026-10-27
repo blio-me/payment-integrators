@@ -21,8 +21,8 @@ import { getIntegratorConfig } from "./lib/diamond";
  * to default either to the deployer EOA.
  *
  * Usage:
- *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] TREASURY=0x... [DEPLOY_OWNER=0x...] \
- *   [DAILY_TX_COUNT_LIMIT=5] [SKIP_REGISTER=false] [DRY_RUN=1] \
+ *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] TREASURY=0x... ATTESTOR=0x... \
+ *   [DEPLOY_OWNER=0x...] [DAILY_TX_COUNT_LIMIT=5] [SKIP_REGISTER=false] [DRY_RUN=1] \
  *   npx hardhat run scripts/deploy-blio.ts --network base
  */
 
@@ -76,6 +76,7 @@ async function main() {
   const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || preset.diamond || "";
   const USDC_ADDRESS = process.env.USDC_ADDRESS || preset.usdc || "";
   const TREASURY = process.env.TREASURY || "";
+  const ATTESTOR = process.env.ATTESTOR || "";
   const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer.address;
 
   console.log(`\n=== BlioCheckoutIntegrator — ${preset.label} (${chainId}) ===`);
@@ -91,6 +92,9 @@ async function main() {
   }
   if (!TREASURY) throw new Error("TREASURY is required — the blio multisig");
   requireChecksummed("TREASURY", TREASURY);
+  if (!ATTESTOR) throw new Error("ATTESTOR is required — the KYC/liveness signer");
+  requireChecksummed("ATTESTOR", ATTESTOR);
+  if (ATTESTOR === ethers.ZeroAddress) throw new Error("ATTESTOR must be non-zero");
 
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
@@ -127,6 +131,7 @@ async function main() {
   console.log(
     `  owner:            ${DEPLOY_OWNER}${DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a multisig)" : ""}`
   );
+  console.log(`  attestor:         ${ATTESTOR}`);
   console.log(`  daily tx count:   ${DAILY_TX_COUNT_LIMIT}`);
 
   if (BigInt(DAILY_TX_COUNT_LIMIT) === 0n) throw new Error("DAILY_TX_COUNT_LIMIT must be > 0");
@@ -144,7 +149,8 @@ async function main() {
     USDC_ADDRESS,
     TREASURY,
     DEPLOY_OWNER,
-    BigInt(DAILY_TX_COUNT_LIMIT)
+    BigInt(DAILY_TX_COUNT_LIMIT),
+    ATTESTOR
   );
   await integrator.deploymentTransaction()?.wait(2);
   const integratorAddr = await integrator.getAddress();
@@ -192,7 +198,7 @@ async function main() {
   console.log("\n--- verify ---");
   console.log(
     `npx hardhat verify --network ${isMainnet ? "base" : "baseSepolia"} ${integratorAddr} ` +
-      `${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${TREASURY} ${DEPLOY_OWNER} ${DAILY_TX_COUNT_LIMIT}`
+      `${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${TREASURY} ${DEPLOY_OWNER} ${DAILY_TX_COUNT_LIMIT} ${ATTESTOR}`
   );
 }
 
