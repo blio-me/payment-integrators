@@ -13,12 +13,13 @@ describe("BlioCheckoutIntegrator", function () {
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
-  const BASE_TX_LIMIT = USDC(50);
-  const DAILY_COUNT_LIMIT = 10;
+  const DAILY_COUNT_LIMIT = 5;
   const PRODUCT_ID = 1;
   const PRODUCT_PRICE = USDC(10);
   const INR = ethers.encodeBytes32String("INR");
   const BRL = ethers.encodeBytes32String("BRL");
+  const TIER_LIVENESS = 1;
+  const TIER_PASSPORT = 2;
 
   beforeEach(async function () {
     [owner, user, user2, treasury] = await ethers.getSigners();
@@ -35,7 +36,6 @@ describe("BlioCheckoutIntegrator", function () {
       await mockUsdc.getAddress(),
       treasury.address,
       owner.address,
-      BASE_TX_LIMIT,
       DAILY_COUNT_LIMIT
     );
 
@@ -69,7 +69,7 @@ describe("BlioCheckoutIntegrator", function () {
     });
 
     it("emits BlioOrderCreated on placement", async function () {
-      await expect(place(user, 3))
+      await expect(place(user, 3, BRL))
         .to.emit(integrator, "BlioOrderCreated")
         .withArgs(1, user.address, PRODUCT_ID, 3, USDC(30));
     });
@@ -101,12 +101,12 @@ describe("BlioCheckoutIntegrator", function () {
 
   describe("Limits", function () {
     it("reverts AmountExceedsLimit above the per-tx cap", async function () {
-      // 6 × 10 = 60 USDC > 50 USDC base limit
+      // 6 × 10 = 60 USDC > 20 USDC (INR, liveness)
       await expect(place(user, 6)).to.be.revertedWithCustomError(integrator, "AmountExceedsLimit");
     });
 
     it("applies a per-currency cap", async function () {
-      await integrator.setMaxTxLimit(BRL, USDC(20));
+      await integrator.setTxLimit(BRL, TIER_LIVENESS, USDC(20));
       expect(await integrator.userTxLimitFor(user.address, BRL)).to.equal(USDC(20));
       await expect(place(user, 3, BRL)).to.be.revertedWithCustomError(
         integrator,
@@ -127,6 +127,66 @@ describe("BlioCheckoutIntegrator", function () {
       await expect(place(user, 1)).to.be.revertedWithCustomError(integrator, "ContractPaused");
       await integrator.unpause();
       await expect(place(user, 1)).to.not.be.reverted;
+    });
+  });
+
+  describe("Currency and tier limits", function () {
+    it("reverts CapExceedsCeiling above the immutable (currency, tier) ceiling", async function () {
+      await expect(
+        integrator.setTxLimit(BRL, TIER_LIVENESS, USDC(51))
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
+      await expect(
+        integrator.setTxLimit(INR, TIER_PASSPORT, USDC(101))
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
+    });
+
+    it("gives INR a tighter limit than the rest for the same tier", async function () {
+      expect(await integrator.userTxLimitFor(user.address, INR)).to.equal(USDC(20));
+      expect(await integrator.userTxLimitFor(user.address, BRL)).to.equal(USDC(50));
+      expect(await integrator.maxTxLimitFor(INR, TIER_LIVENESS)).to.equal(USDC(20));
+      expect(await integrator.maxTxLimitFor(BRL, TIER_LIVENESS)).to.equal(USDC(50));
+    });
+
+    it("gives passport a higher limit than liveness", async function () {
+      expect(await integrator.limitFor(INR, TIER_LIVENESS)).to.equal(USDC(20));
+      expect(await integrator.limitFor(INR, TIER_PASSPORT)).to.equal(USDC(100));
+      expect(await integrator.limitFor(BRL, TIER_LIVENESS)).to.equal(USDC(50));
+      expect(await integrator.limitFor(BRL, TIER_PASSPORT)).to.equal(USDC(200));
+    });
+
+    it("rejects a quantity whose total exceeds the effective limit", async function () {
+      // 2 × 10 = 20 USDC is exactly the INR/liveness cap.
+      await expect(place(user, 2)).to.not.be.reverted;
+      // 3 × 10 = 30 USDC is above it.
+      await expect(place(user, 3)).to.be.revertedWithCustomError(integrator, "AmountExceedsLimit");
+    });
+
+    it("rejects the sixth order of the day", async function () {
+      for (let i = 0; i < DAILY_COUNT_LIMIT; i++) await place(user, 1);
+      expect(await integrator.getTodayCount(user.address)).to.equal(DAILY_COUNT_LIMIT);
+      await expect(place(user, 1)).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
+    });
+
+    it("userTxLimit(currency) matches userTxLimitFor(user, currency)", async function () {
+      expect(await integrator.connect(user).userTxLimit(INR)).to.equal(
+        await integrator.userTxLimitFor(user.address, INR)
+      );
+      expect(await integrator.connect(user).userTxLimit(BRL)).to.equal(
+        await integrator.userTxLimitFor(user.address, BRL)
+      );
+    });
+
+    it("constructor rejects a daily count above the hard cap", async function () {
+      const I = await ethers.getContractFactory("BlioCheckoutIntegrator");
+      await expect(
+        I.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          treasury.address,
+          owner.address,
+          DAILY_COUNT_LIMIT + 1
+        )
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
     });
   });
 
@@ -188,16 +248,16 @@ describe("BlioCheckoutIntegrator", function () {
       const d = await mockDiamond.getAddress();
       const u = await mockUsdc.getAddress();
       await expect(
-        I.deploy(ethers.ZeroAddress, u, treasury.address, owner.address, BASE_TX_LIMIT, 10)
+        I.deploy(ethers.ZeroAddress, u, treasury.address, owner.address, DAILY_COUNT_LIMIT)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
-        I.deploy(d, ethers.ZeroAddress, treasury.address, owner.address, BASE_TX_LIMIT, 10)
+        I.deploy(d, ethers.ZeroAddress, treasury.address, owner.address, DAILY_COUNT_LIMIT)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
-        I.deploy(d, u, ethers.ZeroAddress, owner.address, BASE_TX_LIMIT, 10)
+        I.deploy(d, u, ethers.ZeroAddress, owner.address, DAILY_COUNT_LIMIT)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
-        I.deploy(d, u, treasury.address, ethers.ZeroAddress, BASE_TX_LIMIT, 10)
+        I.deploy(d, u, treasury.address, ethers.ZeroAddress, DAILY_COUNT_LIMIT)
       ).to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner");
     });
   });

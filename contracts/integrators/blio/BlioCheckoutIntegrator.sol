@@ -39,6 +39,14 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    /// @notice Buyer verification tier. `None` means no attestation and gets a
+    ///         zero limit once the Phase 2 gate lands.
+    enum Tier {
+        None,
+        Liveness,
+        Passport
+    }
+
     // ─── Errors ───────────────────────────────────────────────────────
 
     error OnlyDiamond();
@@ -54,13 +62,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     error RenounceDisabled();
     /// @notice An owner-settable limit was set above its immutable ceiling.
     error CapExceedsCeiling();
+    error InvalidTier();
 
     // ─── Events ───────────────────────────────────────────────────────
 
     event ProductPriceSet(uint256 indexed productId, uint256 price);
     event ProductActiveSet(uint256 indexed productId, bool active);
-    event BaseTxLimitUpdated(uint256 limit);
-    event MaxTxLimitUpdated(bytes32 indexed currency, uint256 cap);
+    event TxLimitUpdated(bytes32 indexed currency, Tier indexed tier, uint256 limit);
     event DailyTxCountLimitUpdated(uint256 count);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
@@ -114,18 +122,33 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     // bounded by these, so no limit can ever exceed its ceiling — not by a
     // compromised owner key. Movement below a ceiling is free in both
     // directions.
-    uint256 public constant MAX_BASE_TX_LIMIT = 5_000e6; // $5,000 per tx
-    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 100; // placements/user/day
+    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5; // placements/user/day
+
+    /// @notice Per-tx ceilings by currency class and verification tier
+    ///         (6 decimals). INR is deliberately tighter than the rest.
+    uint256 public constant MAX_TX_LIMIT_INR_LIVENESS = 20e6; // $20
+    uint256 public constant MAX_TX_LIMIT_INR_PASSPORT = 100e6; // $100
+    uint256 public constant MAX_TX_LIMIT_OTHER_LIVENESS = 50e6; // $50
+    uint256 public constant MAX_TX_LIMIT_OTHER_PASSPORT = 200e6; // $200
+
+    bytes32 public constant INR_CURRENCY = bytes32("INR");
+    /// @notice Wildcard bucket every non-INR currency normalizes to.
+    bytes32 public constant OTHER_CURRENCY = bytes32(0);
 
     // ─── Configurable limits ──────────────────────────────────────────
 
-    /// @notice Per-tx USDC cap applied to every order (6 decimals).
-    uint256 public baseTxLimit;
-    /// @notice Optional per-currency cap; 0 means "no extra cap".
-    mapping(bytes32 => uint256) public maxTxLimit;
+    /// @dev Effective per-tx USDC cap by normalized currency and tier
+    ///      (6 decimals). Initialized to the immutable ceilings in the
+    ///      constructor; every owner write is bounded by them.
+    mapping(bytes32 => mapping(Tier => uint256)) private _limitFor;
     /// @notice Placements allowed per user per UTC day.
     uint256 public dailyTxCountLimit;
     bool public paused;
+
+    /// @notice Buyer verification tier, populated by the Phase 2 attestation
+    ///         gate. Empty until then; `_tierOf` defaults to `Liveness` so the
+    ///         current checkout keeps working.
+    mapping(address => Tier) public tierOf;
 
     // ─── Products ─────────────────────────────────────────────────────
 
@@ -178,15 +201,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      * @param _owner        Operator key (a multisig): limits, products, pause.
      *                      Transferable two-step via `transferOwnership` /
      *                      `acceptOwnership`.
-     * @param _baseTxLimit  Per-tx USDC cap (6 decimals).
-     * @param _dailyTxCount Placements per user per day.
+     * @param _dailyTxCount Placements per user per day (max 5).
      */
     constructor(
         address _diamond,
         address _usdc,
         address _treasury,
         address _owner,
-        uint256 _baseTxLimit,
         uint256 _dailyTxCount
     ) Ownable(_owner) {
         if (
@@ -196,14 +217,19 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             _owner == address(0)
         ) revert InvalidAddress();
         if (_dailyTxCount == 0) revert InvalidQuantity();
-        if (_baseTxLimit > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
         if (_dailyTxCount > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
 
         diamond = _diamond;
         usdc = IERC20(_usdc);
         treasury = _treasury;
-        baseTxLimit = _baseTxLimit;
         dailyTxCountLimit = _dailyTxCount;
+
+        // Seed the whole matrix at its immutable ceiling. Non-INR currencies
+        // share the OTHER_CURRENCY bucket, so one write covers "resto".
+        _limitFor[INR_CURRENCY][Tier.Liveness] = MAX_TX_LIMIT_INR_LIVENESS;
+        _limitFor[INR_CURRENCY][Tier.Passport] = MAX_TX_LIMIT_INR_PASSPORT;
+        _limitFor[OTHER_CURRENCY][Tier.Liveness] = MAX_TX_LIMIT_OTHER_LIVENESS;
+        _limitFor[OTHER_CURRENCY][Tier.Passport] = MAX_TX_LIMIT_OTHER_PASSPORT;
 
         proxyImpl = address(new UserProxy());
     }
@@ -220,16 +246,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         emit ProductActiveSet(productId, active);
     }
 
-    function setBaseTxLimit(uint256 limit) external onlyOwner {
-        if (limit > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
-        baseTxLimit = limit;
-        emit BaseTxLimitUpdated(limit);
-    }
-
-    function setMaxTxLimit(bytes32 currency, uint256 cap) external onlyOwner {
-        if (cap > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
-        maxTxLimit[currency] = cap;
-        emit MaxTxLimitUpdated(currency, cap);
+    function setTxLimit(bytes32 currency, Tier tier, uint256 limit) external onlyOwner {
+        if (tier == Tier.None) revert InvalidTier();
+        if (limit == 0) revert InvalidQuantity();
+        if (limit > maxTxLimitFor(currency, tier)) revert CapExceedsCeiling();
+        bytes32 key = normalizeCurrency(currency);
+        _limitFor[key][tier] = limit;
+        emit TxLimitUpdated(currency, tier, limit);
     }
 
     function setDailyTxCountLimit(uint256 count) external onlyOwner {
@@ -453,16 +476,47 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
 
     // ─── Views ────────────────────────────────────────────────────────
 
-    /// @notice Effective per-tx USDC limit for `user` in `currency`.
-    function userTxLimitFor(address /*user*/, bytes32 currency) public view returns (uint256) {
-        uint256 cap = maxTxLimit[currency];
-        if (cap > 0 && cap < baseTxLimit) return cap;
-        return baseTxLimit;
+    /// @notice Effective per-tx USDC limit for `user` in `currency`, based on
+    ///         the buyer's verification tier.
+    function userTxLimitFor(address user, bytes32 currency) public view returns (uint256) {
+        Tier tier = _tierOf(user);
+        if (tier == Tier.None) return 0;
+        return _limitFor[normalizeCurrency(currency)][tier];
     }
 
-    /// @notice Parameterless per-tx cap, for the widget's `fetchUserTxLimit`.
-    function userTxLimit() external view returns (uint256) {
-        return baseTxLimit;
+    /// @notice Effective per-tx USDC cap stored for `currency` at `tier`.
+    function limitFor(bytes32 currency, Tier tier) public view returns (uint256) {
+        return _limitFor[normalizeCurrency(currency)][tier];
+    }
+
+    /// @notice Widget helper: effective per-tx cap for the caller in `currency`.
+    function userTxLimit(bytes32 currency) external view returns (uint256) {
+        return userTxLimitFor(msg.sender, currency);
+    }
+
+    /// @notice Currency class the limit matrix is keyed by: INR is its own
+    ///         bucket and every other currency shares `OTHER_CURRENCY`.
+    function normalizeCurrency(bytes32 currency) public pure returns (bytes32) {
+        return currency == INR_CURRENCY ? INR_CURRENCY : OTHER_CURRENCY;
+    }
+
+    /// @notice Immutable ceiling for a (currency, tier) pair.
+    function maxTxLimitFor(bytes32 currency, Tier tier) public pure returns (uint256) {
+        bool inr = normalizeCurrency(currency) == INR_CURRENCY;
+        if (tier == Tier.Passport) {
+            return inr ? MAX_TX_LIMIT_INR_PASSPORT : MAX_TX_LIMIT_OTHER_PASSPORT;
+        }
+        if (tier == Tier.Liveness) {
+            return inr ? MAX_TX_LIMIT_INR_LIVENESS : MAX_TX_LIMIT_OTHER_LIVENESS;
+        }
+        return 0;
+    }
+
+    /// @dev TODO(Fase 2): once the attestation gate exists, return `tierOf[user]`
+    ///      directly — an unattested buyer (`None`) must have a zero limit.
+    function _tierOf(address user) internal view returns (Tier) {
+        Tier tier = tierOf[user];
+        return tier == Tier.None ? Tier.Liveness : tier;
     }
 
     function getRemainingDailyCount(address user) external view returns (uint256) {

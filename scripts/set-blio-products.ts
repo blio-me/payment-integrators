@@ -6,8 +6,8 @@ import { ethers } from "hardhat";
  * differs from the target, so it is safe to re-run.
  *
  * Prices match the web/app PLANS (9.99 / 26.99 / 49.99 / 79.99 USDC) and must
- * stay within the integrator's `baseTxLimit` (set to at least 100 USDC in
- * scripts/deploy-blio.ts).
+ * stay within the buyer's tier limit (INR/liveness $20, passport $100; other
+ * currencies $50/$200) or userPlaceOrder reverts with AmountExceedsLimit.
  *
  * setProductPrice/setProductActive are onlyOwner, so the signer MUST be the
  * blio owner Safe (or its delegate).
