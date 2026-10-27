@@ -267,7 +267,7 @@ Por eso blio implementa ambos sin revertir y con guards de idempotencia. Aun as�
 
 - **Safe directa:** el USDC llega a la Safe; no hace falta que implemente `receive()` para ERC-20. Para moverlo hay que proponer/ejecutar una transacción Safe.
 - **Diseño vigente (Fase 3):** el USDC llega **directo a la Safe de blio** (`0xFB25…`, v1.5.0 2-de-3), que es el `treasury` inmutable del integrador. No hay contrato intermedio, ni reparto, ni afiliados. El integrador nunca custodia fondos.
-- **Riesgo si se registra `usdcThroughIntegrator = true`:** el USDC iría al integrador, no al `recipientAddr`. Blio lo detectaría con `SettlementRoutingAnomaly`, pero el dinero quedaría atrapado hasta un `sweepUsdc` del owner. El registro correcto es **`false`**, y así están v1 y v2.
+- **Riesgo si se registra `usdcThroughIntegrator = true`:** el USDC iría al integrador, no al `recipientAddr`. Blio lo detectaría con `SettlementRoutingAnomaly`, pero el dinero quedaría atrapado hasta que el owner recupere los tokens extraviados. El registro correcto es **`false`**, y así están v1 y v2.
 
 ## 7. Eventos necesarios para conceder Premium
 
@@ -361,7 +361,7 @@ Commits de la rama:
 
 ```text
 21217e8 chore(blio): script de productos + baseTxLimit 100 en deploy
-14dae14 feat(blio): add BlioTreasuryVault as treasury target (whitelist #117)
+14dae14 feat(blio): contrato intermedio de tesorería (eliminado en Fase 3)
 9e94605 fix(blio): add immutable MAX_ ceilings on owner-settable limits
 f62d41f feat(integrator): add BlioCheckoutIntegrator
 ```
