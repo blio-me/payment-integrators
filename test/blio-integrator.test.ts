@@ -540,4 +540,223 @@ describe("BlioCheckoutIntegrator", function () {
       );
     });
   });
+
+  describe("Cancel callback disabled", function () {
+    it("completes an order cancelled without onOrderCancel and still grants Premium", async function () {
+      // The real Diamond reports cancelCallbackEnabled = false by default, so a
+      // cancellation is visible only protocol-side. Premium must still be
+      // granted when the order is later reopened and completed.
+      const cfg = await mockDiamond.getIntegratorConfig(await integrator.getAddress());
+      expect(cfg.cancelCallbackEnabled).to.equal(false);
+
+      await place(user, 2);
+      const before = await mockUsdc.balanceOf(treasury.address);
+
+      await mockDiamond.simulateOrderCancelledNoCallback(1);
+
+      // No callback: the integrator never learned about the cancellation.
+      expect((await integrator.getSession(1)).cancelled).to.equal(false);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+
+      await expect(mockDiamond.simulateOrderComplete(1))
+        .to.emit(integrator, "BlioOrderCompleted")
+        .withArgs(1, user.address, PRODUCT_ID, 2, USDC(20));
+
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(before + USDC(20));
+      expect((await integrator.getSession(1)).fulfilled).to.equal(true);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+    });
+  });
+
+  describe("Treasury as a contract", function () {
+    it("delivers the USDC to a Safe-like contract with code", async function () {
+      const Safe = await ethers.getContractFactory("MockSafe");
+      const safe = await Safe.deploy([owner.address], 1);
+      const safeAddr = await safe.getAddress();
+
+      const I = await ethers.getContractFactory("BlioCheckoutIntegrator");
+      const safeIntegrator = await I.deploy(
+        await mockDiamond.getAddress(),
+        await mockUsdc.getAddress(),
+        safeAddr,
+        owner.address,
+        DAILY_COUNT_LIMIT,
+        attestor.address
+      );
+      await mockDiamond.registerIntegrator(
+        await safeIntegrator.getAddress(),
+        await safeIntegrator.proxyImpl()
+      );
+      await safeIntegrator.setProductPrice(PRODUCT_ID, PRODUCT_PRICE);
+      await safeIntegrator.setProductActive(PRODUCT_ID, true);
+
+      integrator = safeIntegrator;
+      await attest(user);
+
+      expect((await ethers.provider.getCode(safeAddr)).length).to.be.greaterThan(2);
+      const before = await mockUsdc.balanceOf(safeAddr);
+
+      await place(user, 2);
+      await expect(mockDiamond.simulateOrderComplete(1))
+        .to.emit(integrator, "BlioOrderCompleted")
+        .withArgs(1, user.address, PRODUCT_ID, 2, USDC(20));
+
+      expect(await mockUsdc.balanceOf(safeAddr)).to.equal(before + USDC(20));
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(0n);
+    });
+  });
+
+  describe("Attestation gate coverage", function () {
+    it("rejects a placement from an unattested buyer before validateOrder runs", async function () {
+      await expect(place(user2, 1)).to.be.revertedWithCustomError(integrator, "NotAttested");
+      expect(await integrator.getTodayCount(user2.address)).to.equal(0);
+      expect(await integrator.tierOf(user2.address)).to.equal(0n);
+    });
+
+    it("returns false from validateOrder when no placement is in flight", async function () {
+      const diamondAddr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_setBalance", [diamondAddr, "0x56BC75E2D63100000"]);
+      const diamondSigner = await ethers.getImpersonatedSigner(diamondAddr);
+
+      // `_pendingPlacement` is empty here, so the guard short-circuits to
+      // false. The NotAttested branch inside validateOrder is shadowed by
+      // userPlaceOrder's own pre-check; this documents that ordering.
+      expect(
+        await integrator
+          .connect(diamondSigner)
+          .validateOrder.staticCall(user2.address, USDC(10), INR)
+      ).to.equal(false);
+    });
+
+    it("rejects a duplicate nullifier and a signature from another key", async function () {
+      const first = await signAttestation({ user: user2.address, tier: TIER_LIVENESS });
+      await submit(user2, first);
+
+      const replay = await signAttestation({
+        user: user2.address,
+        tier: TIER_PASSPORT,
+        nullifier: first.nullifier,
+      });
+      await expect(submit(user2, replay)).to.be.revertedWithCustomError(
+        integrator,
+        "NullifierUsed"
+      );
+
+      const wrongKey = await signAttestation({
+        user: user2.address,
+        signer: outsider,
+      });
+      await expect(submit(user2, wrongKey)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidSignature"
+      );
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+    });
+  });
+
+  describe("Limits coverage", function () {
+    it("enforces INR and other-currency caps for multi-unit orders at liveness", async function () {
+      await expect(place(user, 2, INR)).to.not.be.reverted; // 2 × 10 = 20, cap
+      await expect(place(user, 3, INR)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+      await expect(place(user, 5, BRL)).to.not.be.reverted; // 5 × 10 = 50, cap
+      await expect(place(user, 6, BRL)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+      expect(await integrator.getTodayCount(user.address)).to.equal(2);
+    });
+
+    it("enforces INR and other-currency caps for multi-unit orders at passport", async function () {
+      await attest(user2, TIER_PASSPORT);
+
+      await expect(place(user2, 10, INR)).to.not.be.reverted; // 100, cap
+      await expect(place(user2, 11, INR)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+      await expect(place(user2, 20, BRL)).to.not.be.reverted; // 200, cap
+      await expect(place(user2, 21, BRL)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsLimit"
+      );
+      expect(await integrator.getTodayCount(user2.address)).to.equal(2);
+    });
+
+    it("rejects the sixth placement even with quantity 1", async function () {
+      for (let i = 0; i < DAILY_COUNT_LIMIT; i++) await place(user, 1);
+
+      await expect(place(user, 1)).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
+      expect(await integrator.getTodayCount(user.address)).to.equal(DAILY_COUNT_LIMIT);
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(0n);
+    });
+  });
+
+  describe("Reentrancy", function () {
+    it("userPlaceOrder is nonReentrant against a hostile Diamond", async function () {
+      const D = await ethers.getContractFactory("ReentrantBlioDiamond");
+      const hostile = await D.deploy();
+
+      const I = await ethers.getContractFactory("BlioCheckoutIntegrator");
+      const guarded = await I.deploy(
+        await hostile.getAddress(),
+        await mockUsdc.getAddress(),
+        treasury.address,
+        owner.address,
+        DAILY_COUNT_LIMIT,
+        attestor.address
+      );
+      await guarded.setProductPrice(PRODUCT_ID, PRODUCT_PRICE);
+      await guarded.setProductActive(PRODUCT_ID, true);
+
+      integrator = guarded;
+      await attest(user);
+      await hostile.configure(await integrator.getAddress(), true);
+
+      await expect(place(user, 1)).to.not.be.reverted;
+
+      expect(await hostile.reentryAttempted()).to.equal(true);
+      expect(await hostile.reentrySucceeded()).to.equal(false);
+      expect(await hostile.reentryError()).to.equal(
+        ethers.id("ReentrancyGuardReentrantCall()").slice(0, 10)
+      );
+      expect((await integrator.getSession(1)).user).to.equal(user.address);
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+    });
+
+    it("onOrderComplete is idempotent for an already fulfilled order", async function () {
+      await place(user, 1);
+      await mockDiamond.simulateOrderComplete(1);
+
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          await integrator.getAddress(),
+          1,
+          user.address,
+          USDC(10),
+          treasury.address
+        )
+      ).to.not.emit(integrator, "BlioOrderCompleted");
+    });
+  });
+
+  describe("Deployment footprint", function () {
+    it("stays under EIP-170 and reports placement gas", async function () {
+      const art = require("../artifacts/contracts/integrators/blio/BlioCheckoutIntegrator.sol/BlioCheckoutIntegrator.json");
+      const size = (art.deployedBytecode.length - 2) / 2;
+      console.log(`      BlioCheckoutIntegrator deployment size: ${size} bytes`);
+      expect(size).to.be.lessThan(24576);
+
+      const first = await place(user, 1, INR);
+      const firstReceipt = await first.wait();
+      console.log(`      userPlaceOrder gas (first, deploys UserProxy): ${firstReceipt!.gasUsed}`);
+
+      const second = await place(user, 1, BRL);
+      const secondReceipt = await second.wait();
+      console.log(`      userPlaceOrder gas (subsequent): ${secondReceipt!.gasUsed}`);
+      expect(firstReceipt!.gasUsed).to.be.greaterThan(0);
+    });
+  });
 });
