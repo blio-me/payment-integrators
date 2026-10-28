@@ -4,7 +4,7 @@
 >
 > **Estado:** verificación de solo lectura sobre el código del repo. No se desplegó nada ni se tocó `blio/apps/api`.
 >
-> **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD de referencia:** `7037b8c`
+> **Repo:** `p2pdotme/payment-integrators` · **Rama:** `feat/integrator-blio` · **HEAD de referencia:** `5dfd36a`
 >
 > **Fecha de verificación:** 2026-10-27 · **Red:** Base Sepolia (`chainId 84532`) · **RPC:** `https://sepolia.base.org`
 
@@ -412,7 +412,7 @@ event SettlementRoutingAnomaly(
 | `test/blio-integrator-poc.test.ts` | PoC del revisor sobre el gate de attestation. |
 
 La tesorería intermedia no forma parte de esta rama: fue eliminada en la Fase 3.
-Esta revisión se apoya en `7037b8c` (allowlist de monedas y TTL/deadline de
+Esta revisión se apoya en `5dfd36a` (allowlist de monedas y TTL/deadline de
 attestation) y en la Fase 6.6: dos attestors y dos dominios EIP-712 separados
 (`LivenessVerifier` / `KycVerifier`), con `limit` acotado por política.
 
@@ -467,9 +467,9 @@ npx hardhat test test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 | Restricción | Valor / estado |
 | --- | --- |
 | Límite de runtime (EIP-170) | **24.576 bytes** |
-| Runtime de `BlioCheckoutIntegrator` | **9.725 bytes** (mucho margen) |
+| Runtime de `BlioCheckoutIntegrator` | **10.447 bytes** (mucho margen) |
 | Runtime del contrato de tesorería intermedio | **eliminado en Fase 3** |
-| Initcode de `BlioCheckoutIntegrator` | **14.029 bytes** (límite EIP-3860: 49.152) |
+| Initcode de `BlioCheckoutIntegrator` | **15.239 bytes** (creación con args: 15.463; límite EIP-3860: 49.152) |
 | Solidity | Compilador **0.8.28**; pragma del contrato `^0.8.20` |
 | Settings | `evmVersion: "cancun"`, `viaIR: true`, optimizer `enabled`, `runs: 200` |
 | OpenZeppelin | **5.6.1** instalado (`package.json`: `^5.0.1`) |

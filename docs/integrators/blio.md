@@ -46,7 +46,8 @@ as a Safe Transaction Builder batch; direct EOA execution is only supported on
 Base Sepolia with an EOA owner (see **Configure products** below).
 
 Per-transaction ceilings are compiled into the bytecode and seeded in the
-constructor. The owner may only tighten them, never raise them:
+constructor. The owner can move a live limit anywhere inside `[0, ceiling]`
+(raise or lower it), but can never exceed the compiled ceiling:
 
 | Currency class | Tier | Per-tx cap |
 | --- | --- | ---: |
