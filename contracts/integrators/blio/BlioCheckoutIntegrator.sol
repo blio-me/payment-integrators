@@ -97,7 +97,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     event UsdcSwept(address indexed to, uint256 amount);
 
     /// @notice A buyer's verification tier was recorded from a valid attestor
-    ///         signature. `nullifier` is single-use (Sybil resistance).
+    ///         signature. `nullifier` is stable per person and bound to the
+    ///         wallet, so re-verification is allowed but another wallet is not.
     event AttestationSubmitted(address indexed user, uint8 indexed tier, bytes32 nullifier);
 
     /// @notice Emitted for every accepted placement so the widget / backend can
@@ -164,9 +165,12 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
 
     /// @notice A signed attestation claim must land within this window of
     ///         `block.timestamp`; a far-future deadline cannot be redeemed.
-    uint256 public constant MAX_ATTESTATION_DEADLINE = 15 minutes;
-    /// @notice How long a recorded tier stays usable after `attestedAt`.
-    ///         Past this point `_tierOf` reports `None` (fail closed).
+    ///         p2p issues short-lived claims with `expiry = issuedAt + 1 hour`;
+    ///         the 2-hour cap leaves margin for block drift.
+    uint256 public constant MAX_ATTESTATION_DEADLINE = 2 hours;
+    /// @notice How long a recorded tier stays usable after `attestedAt`,
+    ///         independent of the signed claim deadline. Past this point
+    ///         `_tierOf` reports `None` (fail closed).
     uint256 public constant ATTESTATION_TTL = 180 days;
 
     /// @notice Per-tx ceilings by currency class and verification tier
@@ -224,10 +228,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     mapping(address => uint256) public attestedAt;
     /// @notice Timestamp after which the recorded tier stops counting.
     mapping(address => uint256) public attestationExpiresAt;
-    /// @notice Per-(tenant, human) Sybil nullifiers already consumed. Once a
-    ///         nullifier is used it can never be replayed, even for another
-    ///         tier or another wallet.
-    mapping(bytes32 => bool) public usedNullifier;
+    /// @notice Wallet each Sybil nullifier is bound to. p2p's nullifier is
+    ///         stable per (tenant, human, contract), so the same wallet may
+    ///         re-attest or upgrade tiers with it, while another wallet can
+    ///         never replay it.
+    mapping(bytes32 => address) public nullifierWallet;
 
     // ─── Products ─────────────────────────────────────────────────────
 
@@ -420,10 +425,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      *         `("LivenessVerifier", "1", block.chainid, address(this))`, signed
      *         by `livenessAttestor`.
      *
-     *         `expiry` is the service's claim deadline. It is capped to
+     *         `expiry` is the service's short-lived claim deadline (p2p signs
+     *         `issuedAt + 1 hour`). It is capped to
      *         `block.timestamp + MAX_ATTESTATION_DEADLINE` so a bearer signature
-     *         cannot sit around forever. The recorded tier then lives until
-     *         `min(block.timestamp + ATTESTATION_TTL, expiry)`.
+     *         cannot sit around forever. The recorded tier is independent of
+     *         that claim and lives for `ATTESTATION_TTL` from acceptance.
      *
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
      * @param limit     Attested per-tx USDC ceiling (6dp). 0 = use policy.
@@ -490,8 +496,9 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
 
     /// @dev Shared intake for both services. `domain` and `typeHash` are the
     ///      service-specific EIP-712 values; `attestor_` is the matching
-    ///      immutable signer. The nullifier set is shared across tiers, so a
-    ///      nullifier spent on liveness can never be replayed as KYC.
+    ///      immutable signer. A nullifier is bound to one wallet and shared
+    ///      across tiers, so the same wallet may re-verify or upgrade, but the
+    ///      nullifier can never be replayed by another wallet.
     function _submitAttestation(
         address wallet,
         bytes32 nullifier,
@@ -506,21 +513,19 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         if (wallet == address(0)) revert InvalidAddress();
         if (block.timestamp >= expiry) revert AttestationExpired();
         if (expiry > block.timestamp + MAX_ATTESTATION_DEADLINE) revert DeadlineTooFar();
-        if (usedNullifier[nullifier]) revert NullifierUsed();
+        address nw = nullifierWallet[nullifier];
+        if (nw != address(0) && nw != wallet) revert NullifierUsed();
         if (uint8(tier) < uint8(tierOf[wallet])) revert TierDowngrade();
 
         bytes32 structHash = keccak256(abi.encode(typeHash, wallet, nullifier, limit, expiry));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domain, structHash));
         if (_recover(digest, signature) != attestor_) revert InvalidSignature();
 
-        usedNullifier[nullifier] = true;
+        nullifierWallet[nullifier] = wallet;
         tierOf[wallet] = tier;
         attestedLimit[wallet] = limit;
         attestedAt[wallet] = block.timestamp;
-
-        uint256 expiresAt = block.timestamp + ATTESTATION_TTL;
-        if (expiry < expiresAt) expiresAt = expiry;
-        attestationExpiresAt[wallet] = expiresAt;
+        attestationExpiresAt[wallet] = block.timestamp + ATTESTATION_TTL;
 
         emit AttestationSubmitted(wallet, uint8(tier), nullifier);
     }

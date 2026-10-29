@@ -638,7 +638,7 @@ describe("BlioCheckoutIntegrator", function () {
 
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
       expect(await integrator.attestedAt(user2.address)).to.be.greaterThan(0);
-      expect(await integrator.usedNullifier(a.nullifier)).to.equal(true);
+      expect(await integrator.nullifierWallet(a.nullifier)).to.equal(user2.address);
       expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
       expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(50));
     });
@@ -725,17 +725,59 @@ describe("BlioCheckoutIntegrator", function () {
       );
     });
 
-    it("reverts NullifierUsed when a liveness nullifier is replayed as KYC", async function () {
+    it("accepts a short-lived claim: expiry = now + 1 hour with a fixed nullifier", async function () {
+      const t = await now();
+      const a = await signKyc({ wallet: user2.address, expiry: t + 3600n });
+
+      await expect(submitKyc(user2, a)).to.emit(integrator, "AttestationSubmitted");
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
+      expect(await integrator.nullifierWallet(a.nullifier)).to.equal(user2.address);
+    });
+
+    it("allows re-attesting with the same wallet and nullifier after the TTL, renewing expiresAt", async function () {
+      const a = await attest(user2, TIER_LIVENESS);
+      const firstExpiresAt = await integrator.attestationExpiresAt(user2.address);
+
+      await ethers.provider.send("evm_increaseTime", [180 * 24 * 60 * 60 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
+      await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
+
+      const reattest = await signLiveness({ wallet: user2.address, nullifier: a.nullifier });
+      await expect(submitLiveness(user2, reattest)).to.emit(integrator, "AttestationSubmitted");
+
+      const renewedExpiresAt = await integrator.attestationExpiresAt(user2.address);
+      const renewedAttestedAt = await integrator.attestedAt(user2.address);
+      expect(renewedExpiresAt).to.equal(renewedAttestedAt + (await integrator.ATTESTATION_TTL()));
+      expect(renewedExpiresAt).to.be.greaterThan(firstExpiresAt);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
+    });
+
+    it("reverts NullifierUsed when another wallet reuses the same nullifier", async function () {
       const first = await signLiveness({ wallet: user2.address });
       await submitLiveness(user2, first);
 
-      const replay = await signKyc({ wallet: user2.address, nullifier: first.nullifier });
-      await expect(submitKyc(user2, replay)).to.be.revertedWithCustomError(
+      const replay = await signKyc({ wallet: user.address, nullifier: first.nullifier });
+      await expect(submitKyc(user, replay)).to.be.revertedWithCustomError(
         integrator,
         "NullifierUsed"
       );
-      // The replay does not upgrade the tier.
-      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
+      expect(await integrator.nullifierWallet(first.nullifier)).to.equal(user2.address);
+      expect(await integrator.tierOf(user.address)).to.equal(TIER_LIVENESS);
+    });
+
+    it("upgrades liveness to passport with the same wallet and nullifier, raising the limit", async function () {
+      const first = await signLiveness({ wallet: user2.address });
+      await submitLiveness(user2, first);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(50));
+
+      const upgrade = await signKyc({ wallet: user2.address, nullifier: first.nullifier });
+      await expect(submitKyc(user2, upgrade)).to.emit(integrator, "AttestationSubmitted");
+
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
+      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(200));
     });
 
     it("reverts AttestationExpired when the signed expiry has already passed", async function () {
@@ -746,12 +788,12 @@ describe("BlioCheckoutIntegrator", function () {
       );
     });
 
-    it("reverts DeadlineTooFar past the 15-minute cap", async function () {
+    it("reverts DeadlineTooFar past the 2-hour cap", async function () {
       const t = await now();
-      // Pin the next block to t+1 so `expiry = t+902` is exactly one second
+      // Pin the next block to t+1 so `expiry = t+7202` is exactly one second
       // beyond `block.timestamp + MAX_ATTESTATION_DEADLINE`.
       await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t) + 1]);
-      const a = await signKyc({ wallet: user2.address, expiry: t + 902n });
+      const a = await signKyc({ wallet: user2.address, expiry: t + 7202n });
       await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(integrator, "DeadlineTooFar");
       expect(await integrator.tierOf(user2.address)).to.equal(0n);
     });
@@ -762,45 +804,37 @@ describe("BlioCheckoutIntegrator", function () {
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
     });
 
-    it("expires a KYC grant at its signed expiry: placement reverts NotAttested", async function () {
-      const expiresAt = await (async () => (await now()) + 600n)();
-      const a = await signKyc({ wallet: user2.address, expiry: expiresAt });
+    it("outlives the signed claim expiry: the grant lasts ATTESTATION_TTL", async function () {
+      const claimExpiry = (await now()) + 600n;
+      const a = await signKyc({ wallet: user2.address, expiry: claimExpiry });
       await submitKyc(user2, a);
 
-      expect(await integrator.attestationExpiresAt(user2.address)).to.equal(expiresAt);
+      const attestedAt = await integrator.attestedAt(user2.address);
+      const expiresAt = await integrator.attestationExpiresAt(user2.address);
+      expect(expiresAt).to.equal(attestedAt + (await integrator.ATTESTATION_TTL()));
+      expect(expiresAt).to.be.greaterThan(claimExpiry);
       await expect(place(user2, 1, INR)).to.not.be.reverted;
 
       await ethers.provider.send("evm_increaseTime", [601]);
       await ethers.provider.send("evm_mine", []);
 
-      // Raw tier is still stored, but the gate treats it as None.
+      // The claim deadline passed, but the recorded tier is still usable.
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
-      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
-      await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
+      await expect(place(user2, 1, INR)).to.not.be.reverted;
     });
 
-    it("caps the recorded grant at min(expiry, ATTESTATION_TTL)", async function () {
-      const a = await attest(user2, TIER_LIVENESS);
-      const expiresAt = await integrator.attestationExpiresAt(user2.address);
-      const attestedAt = await integrator.attestedAt(user2.address);
-      expect(expiresAt).to.equal(a.expiry);
-      expect(expiresAt).to.be.lessThan(attestedAt + (await integrator.ATTESTATION_TTL()));
+    it("expires the grant at ATTESTATION_TTL regardless of the claim expiry", async function () {
+      await attest(user2, TIER_LIVENESS);
+      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
 
-      await ethers.provider.send("evm_increaseTime", [601]);
+      await ethers.provider.send("evm_increaseTime", [180 * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine", []);
 
+      // Raw tier is still stored, but the gate treats it as None.
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
       expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(0n);
       await expect(place(user2, 1, INR)).to.be.revertedWithCustomError(integrator, "NotAttested");
-
-      // A fresh attestation revives it (the old nullifier is single-use).
-      const replay = await signLiveness({ wallet: user2.address, nullifier: a.nullifier });
-      await expect(submitLiveness(user2, replay)).to.be.revertedWithCustomError(
-        integrator,
-        "NullifierUsed"
-      );
-      const reattest = await signLiveness({ wallet: user2.address });
-      await expect(submitLiveness(user2, reattest)).to.not.be.reverted;
-      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(20));
     });
 
     it("clamps a KYC limit above policy to 100/200", async function () {
@@ -856,7 +890,7 @@ describe("BlioCheckoutIntegrator", function () {
       );
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
       // A rejected downgrade must not burn the nullifier.
-      expect(await integrator.usedNullifier(down.nullifier)).to.equal(false);
+      expect(await integrator.nullifierWallet(down.nullifier)).to.equal(ethers.ZeroAddress);
     });
 
     it("blocks an order from an unattested address", async function () {
@@ -970,12 +1004,12 @@ describe("BlioCheckoutIntegrator", function () {
       ).to.equal(false);
     });
 
-    it("rejects a duplicate nullifier and a signature from another key", async function () {
+    it("rejects a nullifier reused by another wallet and a signature from another key", async function () {
       const first = await signLiveness({ wallet: user2.address });
       await submitLiveness(user2, first);
 
-      const replay = await signKyc({ wallet: user2.address, nullifier: first.nullifier });
-      await expect(submitKyc(user2, replay)).to.be.revertedWithCustomError(
+      const replay = await signKyc({ wallet: user.address, nullifier: first.nullifier });
+      await expect(submitKyc(user, replay)).to.be.revertedWithCustomError(
         integrator,
         "NullifierUsed"
       );

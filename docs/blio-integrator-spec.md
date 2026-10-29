@@ -214,15 +214,17 @@ attestation revierte con `NotAttested` (falla cerrado y su límite es cero).
   efectivo es el firmado **solo si es menor** que la política de esa
   moneda/tier; `0` o un valor **mayor** caen a la política. Nunca amplía el
   techo: passport sigue en **100** (INR) / **200** (resto).
-- **`expiry`:** deadline de claim del servicio. Debe estar en el futuro y como
-  máximo a `MAX_ATTESTATION_DEADLINE` (15 minutos); si no, revierte
-  `DeadlineTooFar`. El grant grabado dura
-  `min(block.timestamp + ATTESTATION_TTL, expiry)`; al vencer, `_tierOf`
-  devuelve `None` (límite cero y `NotAttested` al colocar) y el comprador debe
-  re-attestarse.
-- **`nullifier`:** compartido entre ambos servicios y de un solo uso
-  (`usedNullifier`); no se puede replicar como KYC, ni para otra wallet u otro
-  tier (`NullifierUsed`).
+- **`expiry`:** deadline de claim del servicio, de vida corta. p2p emite
+  claims con `expiry = issuedAt + 1 hora`; el contrato los acepta si están en
+  el futuro y como máximo a `MAX_ATTESTATION_DEADLINE` (**2 horas**); si no,
+  revierte `DeadlineTooFar`. El TTL del tier es **independiente del claim**:
+  dura `ATTESTATION_TTL` (**180 días**) desde la aceptación. Al vencer,
+  `_tierOf` devuelve `None` (límite cero y `NotAttested` al colocar) y el
+  comprador debe re-attestarse.
+- **`nullifier`:** estable por persona y contrato, y **ligado al wallet**
+  (`nullifierWallet`), no de un solo uso. El mismo wallet puede re-attestarse
+  tras el TTL o subir liveness → passport con el mismo nullifier; usarlo desde
+  **otro wallet** revierte `NullifierUsed`.
 
 ### 4.2 Allowlist de monedas
 
@@ -420,12 +422,12 @@ attestation) y en la Fase 6.6: dos attestors y dos dominios EIP-712 separados
 
 El baseline de **19 tests** de la Fase 0 quedó obsoleto. La rama añadió
 attestation (dos firmas EIP-712 con dominios y claves separadas, firma cruzada,
-`limit` acotado por política, replay compartido del nullifier, `expiry` y
-`DeadlineTooFar`, downgrade, relayer KYC, comprador sin attestation), límites
+`limit` acotado por política, nullifier ligado al wallet (re-verificación),
+`expiry` y `DeadlineTooFar`, downgrade, relayer KYC, comprador sin attestation), límites
 por moneda y nivel, cupo diario, Safe/contrato como treasury, reentrancy,
-idempotencia y footprint. La suite declara **69 casos** en
+idempotencia y footprint. La suite declara **72 casos** en
 `test/blio-integrator.test.ts` y **3** en `test/blio-integrator-poc.test.ts`
-(**72 passing**); el número se obtiene
+(**75 passing**); el número se obtiene
 ejecutando:
 
 ```bash
@@ -452,9 +454,10 @@ npx hardhat test test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 
 - **Attestation:** cada attestor válido en su flujo, firma cruzada
   (clave/tipo/dominio) → `InvalidSignature`, `limit` por encima y por debajo de
-  la política, `nullifier` compartido liveness→KYC, `expiry` vencido →
-  `NotAttested`, `DeadlineTooFar` a más de 15 min, downgrade, relayer KYC y
-  comprador sin attestation.
+  la política, `nullifier` ligado al wallet (re-verificación y upgrade
+  permitidos, otro wallet → `NullifierUsed`), `expiry` de claim vencido sin
+  cortar el tier, `DeadlineTooFar` a más de 2 h, `NotAttested` tras el TTL,
+  downgrade, relayer KYC y comprador sin attestation.
 - **Cancelación:** con `cancelCallbackEnabled = false`, una orden cancelada sin
   callback puede completarse y emitir Premium; el cupo no se libera.
 - **Treasury:** EOA y contrato tipo Safe.
@@ -467,9 +470,9 @@ npx hardhat test test/blio-integrator.test.ts test/blio-integrator-poc.test.ts
 | Restricción | Valor / estado |
 | --- | --- |
 | Límite de runtime (EIP-170) | **24.576 bytes** |
-| Runtime de `BlioCheckoutIntegrator` | **10.447 bytes** (mucho margen) |
+| Runtime de `BlioCheckoutIntegrator` | **10.523 bytes** (mucho margen) |
 | Runtime del contrato de tesorería intermedio | **eliminado en Fase 3** |
-| Initcode de `BlioCheckoutIntegrator` | **15.239 bytes** (creación con args: 15.463; límite EIP-3860: 49.152) |
+| Initcode de `BlioCheckoutIntegrator` | **15.315 bytes** (límite EIP-3860: 49.152) |
 | Solidity | Compilador **0.8.28**; pragma del contrato `^0.8.20` |
 | Settings | `evmVersion: "cancun"`, `viaIR: true`, optimizer `enabled`, `runs: 200` |
 | OpenZeppelin | **5.6.1** instalado (`package.json`: `^5.0.1`) |

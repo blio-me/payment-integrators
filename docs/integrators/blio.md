@@ -98,18 +98,21 @@ the constructor as immutables.
   signed value only when it is **below** the policy for that currency/tier;
   `0` or anything **above** the policy falls back to the policy. It can never
   widen a cap, so passport stays at **100** (INR) / **200** (other).
-- **`expiry`:** the service's claim deadline. It must be strictly in the
-  future and at most `MAX_ATTESTATION_DEADLINE` (15 minutes) ahead, or the call
-  reverts `DeadlineTooFar`. The recorded grant lives until
-  `min(block.timestamp + ATTESTATION_TTL, expiry)`; past it `_tierOf` reports
-  `None` (zero limit, `NotAttested` on placement) and the buyer must be
-  re-attested.
+- **`expiry`:** the service's short-lived claim deadline. p2p issues claims
+  with `expiry = issuedAt + 1 hour`; the contract accepts them when they are
+  strictly in the future and at most `MAX_ATTESTATION_DEADLINE` (**2 hours**)
+  ahead, or the call reverts `DeadlineTooFar`. The recorded tier is
+  **independent of the claim**: it lives for `ATTESTATION_TTL` (**180 days**)
+  from acceptance. Past the TTL `_tierOf` reports `None` (zero limit,
+  `NotAttested` on placement) and the buyer must be re-attested.
 - **`wallet`:** liveness binds `msg.sender`; KYC binds the explicit `wallet`
   argument, so a relayer (e.g. the gas service) may land it without changing
   the grant.
-- **Nullifier:** shared across both services and single-use (`usedNullifier`),
-  so a liveness nullifier cannot be replayed as KYC, another wallet or another
-  tier. Reuse reverts with `NullifierUsed`.
+- **Nullifier:** p2p's nullifier is stable per person (and per contract) and is
+  **bound to the wallet** (`nullifierWallet`), not single-use. The same wallet
+  may re-attest after the TTL or upgrade liveness → passport with the same
+  nullifier; presenting it from **another wallet** reverts with
+  `NullifierUsed`.
 
 Signing sketch (ethers):
 
